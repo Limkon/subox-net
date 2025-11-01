@@ -1362,7 +1362,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     ShowTrayTip(L"请稍候", L"正在获取最新配置文件...");
 
     // 3. (修改) 下载配置文件
-    const wchar_t* configUrl = L"https://kcoo.cbu.net/share/view/file/e24d34bd8a15cf66cad8f97bae1abf43";
+    const wchar_t* configUrl = L"https://kcoo.cbu.net/share/view/file/28d969968c0b798c152dd17acbc369bd";
     const wchar_t* configPath = L"config.json";
     
     if (!DownloadConfig(configUrl, configPath)) {
