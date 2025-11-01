@@ -17,6 +17,7 @@
  * (Fix): Added -k (insecure) flag to curl to bypass SSL/TLS verification.
  * (Modification): (REMOVED) Icon load failure warning.
  * (Modification): (NEW) Show "Loading config..." tip on tray icon during download.
+ * (Fix): Moved LoadSettings() to before tray icon creation to respect g_isIconVisible on startup.
  */
 
 // 必须在包含任何 Windows 头文件之前定义
@@ -1320,6 +1321,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     }
 
     // --- (修改) 启动逻辑 ---
+    
+    // (--- 新增：提前加载设置 ---)
+    // 必须在注册热键和显示托盘图标之前加载
+    LoadSettings();
+
     // 1. 创建窗口和托盘图标
     const wchar_t* CLASS_NAME = L"TrayWindowClass";
     WNDCLASSW wc = {0};
@@ -1339,6 +1345,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
         return 1;
     }
 
+    // (--- 移动到 LoadSettings() 之后 ---)
+    // 现在 g_hotkeyVk 和 g_hotkeyModifiers 已经从 set.ini 加载
     if (g_hotkeyVk != 0 || g_hotkeyModifiers != 0) {
         if (!RegisterHotKey(hwnd, ID_GLOBAL_HOTKEY, g_hotkeyModifiers, g_hotkeyVk)) {
             MessageBoxW(NULL, L"注册全局快捷键失败！\n可能已被其他程序占用。", L"快捷键错误", MB_OK | MB_ICONWARNING);
@@ -1354,11 +1362,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     wcsncpy(nid.szTip, L"程序正在启动...", ARRAYSIZE(nid.szTip) - 1);
     nid.szTip[ARRAYSIZE(nid.szTip) - 1] = L'\0';
 
+    // (--- 移动到 LoadSettings() 之后 ---)
+    // 现在 g_isIconVisible 已经从 set.ini 加载
     if (g_isIconVisible) {
         Shell_NotifyIconW(NIM_ADD, &nid);
     }
 
     // 2. (新增) 显示“正在加载”提示
+    // (--- 移动到 LoadSettings() 之后 ---)
+    // 如果 g_isIconVisible 为 FALSE, ShowTrayTip 内部会直接返回
     ShowTrayTip(L"请稍候", L"正在获取最新配置文件...");
 
     // 3. (修改) 下载配置文件
@@ -1376,7 +1388,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     }
     // --- 修改结束 ---
 
-    LoadSettings();
+    // LoadSettings(); // (--- 已移动到前面 ---)
     
     // (--- 调试：修改 ParseTags 失败后的提示 ---)
     if (!ParseTags()) {
@@ -1391,7 +1403,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     
     // (修改) 更新托盘提示为“程序正在运行”
     wcsncpy(nid.szTip, L"程序正在运行...", ARRAYSIZE(nid.szTip) - 1);
-    Shell_NotifyIconW(NIM_MODIFY, &nid);
+    // (修改) 仅当图标可见时才更新提示
+    if(g_isIconVisible) {
+        Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
     
     // 确保启动前 g_isExiting 为 false
     g_isExiting = FALSE;
