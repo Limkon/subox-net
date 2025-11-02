@@ -2,14 +2,12 @@
  * * Refactored version with:
  * 1. Process Crash Monitoring (MonitorThread)
  * 2. Stdout/Stderr Log Monitoring (LogMonitorThread)
- * 3. Automatic Node Switching on connection errors (timeout, refused)
- * 4. Auto-Switch Cooldown (60s)
- * 5. Robust log buffer parsing
- * 6. Log Viewer Window to display live sing-box output
+ * 3. Robust log buffer parsing
+ * 4. Log Viewer Window to display live sing-box output
  *
  * (Modification): Node switching now targets 'route.final'
  * (Modification): (REMOVED) Node management features (Add/Delete/Update)
- * (NEW): Downloads config.json from a fixed URL on startup.
+ * (NEW): Downloads config.json from 'set.ini' (g_configUrl) on startup.
  * (Fix): (REMOVED) WinINet, PowerShell, and bitsadmin downloaders.
  * (NEW): Using 'curl.exe' (assumed to be in the same directory) to download.
  * (Modification): (REMOVED) Node converter menu item and functionality.
@@ -18,6 +16,8 @@
  * (Modification): (REMOVED) Icon load failure warning.
  * (Modification): (NEW) Show "Loading config..." tip on tray icon during download.
  * (Fix): Moved LoadSettings() to before tray icon creation to respect g_isIconVisible on startup.
+ * (Modification): (REMOVED) Automatic node switching feature.
+ * (Modification): (NEW) Config download URL is now read from set.ini [Settings] ConfigUrl.
  */
 
 // 必须在包含任何 Windows 头文件之前定义
@@ -56,8 +56,8 @@ static const GUID APP_GUID = { 0xbfd8a583, 0x662a, 0x4fe3, { 0x97, 0x84, 0xfa, 0
 
 #define WM_TRAY (WM_USER + 1)
 #define WM_SINGBOX_CRASHED (WM_USER + 2)     // 消息：核心进程崩溃
-#define WM_SINGBOX_RECONNECT (WM_USER + 3)   // 消息：日志检测到错误，请求自动切换
-#define WM_LOG_UPDATE (WM_USER + 4)          // 消息：日志线程发送新的日志文本
+// #define WM_SINGBOX_RECONNECT (WM_USER + 3)   // (已移除) 自动切换
+#define WM_LOG_UPDATE (WM_USER + 3)          // 消息：日志线程发送新的日志文本 (值已调整)
 
 #define ID_TRAY_EXIT 1001
 #define ID_TRAY_AUTORUN 1002
@@ -99,6 +99,7 @@ BOOL g_isIconVisible = TRUE;
 UINT g_hotkeyModifiers = 0;
 UINT g_hotkeyVk = 0;
 wchar_t g_iniFilePath[MAX_PATH] = {0};
+wchar_t g_configUrl[2048] = {0}; // (--- 新增：用于存储配置URL ---)
 
 // --- 重构：新增守护功能全局变量 ---
 HANDLE hMonitorThread = NULL;           // 进程崩溃监控线程
@@ -252,9 +253,14 @@ char* ConvertLfToCrlf(const char* input) {
 
 // 快捷键设置功能函数
 void LoadSettings() {
+    // (--- 新增：默认URL ---)
+    const wchar_t* defaultConfigUrl = L"https://kcoo.cbu.net/share/view/file/a3b48c486a46629f06af19e8431018d3";
+    
     g_hotkeyModifiers = GetPrivateProfileIntW(L"Settings", L"Modifiers", 0, g_iniFilePath);
     g_hotkeyVk = GetPrivateProfileIntW(L"Settings", L"VK", 0, g_iniFilePath);
     g_isIconVisible = GetPrivateProfileIntW(L"Settings", L"ShowIcon", 1, g_iniFilePath);
+    // (--- 新增：读取URL ---)
+    GetPrivateProfileStringW(L"Settings", L"ConfigUrl", defaultConfigUrl, g_configUrl, ARRAYSIZE(g_configUrl), g_iniFilePath);
 }
 
 void SaveSettings() {
@@ -265,6 +271,8 @@ void SaveSettings() {
     WritePrivateProfileStringW(L"Settings", L"VK", buffer, g_iniFilePath);
     wsprintfW(buffer, L"%d", g_isIconVisible);
     WritePrivateProfileStringW(L"Settings", L"ShowIcon", buffer, g_iniFilePath);
+    // (--- 新增：保存URL ---)
+    WritePrivateProfileStringW(L"Settings", L"ConfigUrl", g_configUrl, g_iniFilePath);
 }
 
 void ToggleTrayIconVisibility() {
@@ -464,8 +472,8 @@ DWORD WINAPI LogMonitorThread(LPVOID lpParam) {
     char lineBuf[8192] = {0}; // 拼接缓冲区，处理跨Read的日志行
     DWORD dwRead;
     BOOL bSuccess;
-    static time_t lastLogTriggeredRestart = 0;
-    const time_t RESTART_COOLDOWN = 60; // 60秒日志触发冷却
+    // static time_t lastLogTriggeredRestart = 0; // (已移除自动切换)
+    // const time_t RESTART_COOLDOWN = 60; // (已移除自动切换)
     HANDLE hPipe = (HANDLE)lpParam;
 
     while (TRUE) {
@@ -510,34 +518,18 @@ DWORD WINAPI LogMonitorThread(LPVOID lpParam) {
         }
 
         // --- 关键词分析 ---
-        // 查找可能需要重启的严重错误
-        char* fatal_pos = strstr(lineBuf, "level\"=\"fatal");
-        char* dial_pos = strstr(lineBuf, "failed to dial");
-        // 新增：检测 timeout 和 connection refused
-        char* timeout_pos = strstr(lineBuf, "timeout"); 
-        char* refused_pos = strstr(lineBuf, "connection refused");
-
-        if (fatal_pos != NULL || dial_pos != NULL || timeout_pos != NULL || refused_pos != NULL) {
-            time_t now = time(NULL);
-            if (now - lastLogTriggeredRestart > RESTART_COOLDOWN) {
-                lastLogTriggeredRestart = now;
-                // 发送重启消息 (现在将触发节点切换)
-                PostMessageW(hwnd, WM_SINGBOX_RECONNECT, 0, 0);
-            }
-            // 处理完错误后，清空缓冲区，防止重复触发
+        // (--- 已移除 ---) 自动切换节点的错误检测 (fatal, dial, timeout, refused)
+        
+        // 我们需要清理缓冲区，只保留最后一行（可能是半行）
+        char* last_newline = strrchr(lineBuf, '\n');
+        if (last_newline != NULL) {
+            // 找到了换行符，只保留换行符之后的内容
+            strcpy(lineBuf, last_newline + 1);
+        } else if (strlen(lineBuf) > 4096) {
+            // 缓冲区已满但没有换行符（异常情况），清空它以防溢出
             lineBuf[0] = '\0';
-        } else {
-            // 如果没有找到错误，我们需要清理缓冲区，只保留最后一行（可能是半行）
-            char* last_newline = strrchr(lineBuf, '\n');
-            if (last_newline != NULL) {
-                // 找到了换行符，只保留换行符之后的内容
-                strcpy(lineBuf, last_newline + 1);
-            } else if (strlen(lineBuf) > 4096) {
-                // 缓冲区已满但没有换行符（异常情况），清空它以防溢出
-                lineBuf[0] = '\0';
-            }
-            // 如果没有换行符且缓冲区未满，则不执行任何操作，等待下一次 ReadFile 拼接
         }
+        // 如果没有换行符且缓冲区未满，则不执行任何操作，等待下一次 ReadFile 拼接
     }
     
     return 0;
@@ -822,7 +814,7 @@ void UpdateMenu() {
 // --- 重构结束 ---
 
 
-// --- 重构：修改 WndProc (增加自动切换节点, 移除管理节点) ---
+// --- 重构：修改 WndProc (移除自动切换节点, 移除管理节点) ---
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     // 自动重启的冷却计时器
     static time_t lastAutoRestart = 0;
@@ -879,67 +871,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ToggleTrayIconVisibility();
         }
     }
-    // --- 重构：处理核心崩溃或日志错误 (新增自动切换) ---
+    // --- 重构：处理核心崩溃或日志错误 (已移除自动切换) ---
     else if (msg == WM_SINGBOX_CRASHED) {
         // 核心崩溃，只提示，不自动操作
         ShowTrayTip(L"Sing-box 监控", L"核心进程意外终止。请手动检查。");
     }
-    else if (msg == WM_SINGBOX_RECONNECT) {
-        // 日志检测到错误（如 timeout），执行自动切换节点
-        
-        // 自动切换的冷却计时器
-        static time_t lastAutoSwitch = 0;
-        const time_t SWITCH_COOLDOWN = 60; // 60秒冷却，防止频繁切换
-        time_t now = time(NULL);
-
-        // 检查是否在冷却时间内
-        if (now - lastAutoSwitch > SWITCH_COOLDOWN) {
-            lastAutoSwitch = now; // 更新切换时间戳
-
-            // 1. 重新解析以获取最新的节点列表
-            ParseTags(); 
-            if (nodeCount <= 1) {
-                 // 只有一个或没有节点，无需切换
-                 ShowTrayTip(L"自动切换", L"检测到连接错误，但无其他节点可切换。");
-                 return DefWindowProcW(hWnd, msg, wParam, lParam);
-            }
-
-            // 2. 找到当前节点的索引
-            int currentIndex = -1;
-            for (int i = 0; i < nodeCount; i++) {
-                if (wcscmp(nodeTags[i], currentNode) == 0) {
-                    currentIndex = i;
-                    break;
-                }
-            }
-
-            // 3. 计算下一个节点的索引（顺序循环切换）
-            int nextIndex;
-            if (currentIndex == -1 || (currentIndex + 1) >= nodeCount) {
-                nextIndex = 0; // 如果找不到当前节点或已是最后一个，则切换到第一个
-            } else {
-                nextIndex = currentIndex + 1; // 切换到下一个
-            }
-            
-            const wchar_t* nextNodeTag = nodeTags[nextIndex];
-
-            // 4. 避免切换到自己（当只有一个节点时）
-            if (wcscmp(currentNode, nextNodeTag) == 0) {
-                 ShowTrayTip(L"自动切换", L"检测到连接错误，但无其他节点可切换。");
-                 return DefWindowProcW(hWnd, msg, wParam, lParam);
-            }
-
-            // 5. 执行切换
-            wchar_t message[256];
-            wsprintfW(message, L"检测到连接错误，自动切换到: %s", nextNodeTag);
-            ShowTrayTip(L"自动切换节点", message);
-
-            // 调用现有的切换函数
-            SwitchNode(nextNodeTag);
-
-        }
-        // 如果在冷却时间内，则不执行任何操作
-    }
+    // (--- 已移除 WM_SINGBOX_RECONNECT (自动切换) 的处理 ---)
     // --- 重构结束 ---
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
@@ -1026,7 +963,7 @@ BOOL IsAutorunEnabled() {
 // (修正): 使用绝对路径启动 curl.exe，并设置工作目录
 // =========================================================================
 BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
-    wchar_t cmdLine[2048]; 
+    wchar_t cmdLine[4096]; // (--- 缓冲区增大以容纳更长的URL ---)
     wchar_t fullSavePath[MAX_PATH];
     wchar_t fullCurlPath[MAX_PATH];
     wchar_t moduleDir[MAX_PATH];
@@ -1324,6 +1261,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     
     // (--- 新增：提前加载设置 ---)
     // 必须在注册热键和显示托盘图标之前加载
+    // (--- g_configUrl 将在此处被加载 ---)
     LoadSettings();
 
     // 1. 创建窗口和托盘图标
@@ -1374,10 +1312,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     ShowTrayTip(L"请稍候", L"正在获取最新配置文件...");
 
     // 3. (修改) 下载配置文件
-    const wchar_t* configUrl = L"https://kcoo.cbu.net/share/view/file/28d969968c0b798c152dd17acbc369bd";
+    // (--- 移除硬编码URL, g_configUrl 在 LoadSettings() 中加载 ---)
+    // const wchar_t* configUrl = L"..."; 
     const wchar_t* configPath = L"config.json";
     
-    if (!DownloadConfig(configUrl, configPath)) {
+    // (--- 修改：使用 g_configUrl ---)
+    // (--- 此处实现了下载失败时拒绝启动的功能 ---)
+    if (!DownloadConfig(g_configUrl, configPath)) {
         // 错误消息已在 DownloadConfig 内部显示
         if (hMutex) CloseHandle(hMutex);
         if (g_hFont) DeleteObject(g_hFont);
@@ -1387,8 +1328,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
         return 1;
     }
     // --- 修改结束 ---
-
-    // LoadSettings(); // (--- 已移动到前面 ---)
     
     // (--- 调试：修改 ParseTags 失败后的提示 ---)
     if (!ParseTags()) {
