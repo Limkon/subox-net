@@ -18,6 +18,11 @@
  * (Fix): Moved LoadSettings() to before tray icon creation to respect g_isIconVisible on startup.
  * (Modification): (REMOVED) Automatic node switching feature.
  * (Modification): (NEW) Config download URL is now read from set.ini [Settings] ConfigUrl.
+ * (Modification): (NEW) Implemented flowchart logic STAGE 2 (Strict):
+ * - 1. Check URL validity by downloading to .tmp file first.
+ * - 2. If download fails (invalid URL/network), EXIT.
+ * - 3. If config.json exists, start core, then compare .tmp file.
+ * - 4. If config.json NOT exist, move .tmp to .json, then start core.
  */
 
 // 必须在包含任何 Windows 头文件之前定义
@@ -186,11 +191,19 @@ void ShowError(const wchar_t* title, const wchar_t* message) {
 
 BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* fileSize) {
     FILE* f = NULL;
-    if (_wfopen_s(&f, filename, L"rb") != 0 || !f) { return FALSE; }
+    if (_wfopen_s(&f, filename, L"rb") != 0 || !f) { 
+        *fileSize = 0;
+        return FALSE; 
+    }
     fseek(f, 0, SEEK_END);
     *fileSize = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (*fileSize <= 0) { fclose(f); return FALSE; }
+    if (*fileSize <= 0) { 
+        *fileSize = 0; // 确保大小为0
+        *buffer = NULL;
+        fclose(f); 
+        return FALSE; // 文件为空也视为失败
+    }
     *buffer = (char*)malloc(*fileSize + 1);
     if (!*buffer) { fclose(f); return FALSE; }
     fread(*buffer, 1, *fileSize, f);
@@ -254,7 +267,7 @@ char* ConvertLfToCrlf(const char* input) {
 // 快捷键设置功能函数
 void LoadSettings() {
     // (--- 新增：默认URL ---)
-    const wchar_t* defaultConfigUrl = L"https://kcoo.cbu.net/share/view/file/a3b48c486a46629f06af19e8431018d3";
+    const wchar_t* defaultConfigUrl = L"";
     
     g_hotkeyModifiers = GetPrivateProfileIntW(L"Settings", L"Modifiers", 0, g_iniFilePath);
     g_hotkeyVk = GetPrivateProfileIntW(L"Settings", L"VK", 0, g_iniFilePath);
@@ -994,7 +1007,7 @@ BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
 
     // 4. 获取 config.json 的绝对路径
     if (GetFullPathNameW(savePath, MAX_PATH, fullSavePath, NULL) == 0) {
-        ShowError(L"下载失败", L"无法获取 config.json 的绝对路径。");
+        ShowError(L"下载失败", L"无法获取配置文件的绝对路径。");
         return FALSE;
     }
 
@@ -1047,7 +1060,9 @@ BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
     CloseHandle(downloaderPi.hThread);
 
     if (exitCode != 0) {
-        ShowError(L"下载失败", L"curl.exe 报告了错误 (退出码非0)。\n请检查网络或 URL 是否正确。");
+        wchar_t errorMsg[512];
+        wsprintfW(errorMsg, L"curl.exe 报告了错误 (退出码 %lu)。\n请检查网络或 URL 是否正确。", exitCode);
+        ShowError(L"下载失败", errorMsg);
         return FALSE;
     }
 
@@ -1065,7 +1080,7 @@ BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
         // 文件存在且大小不为0，视为成功
         return TRUE; 
     } else {
-        ShowError(L"下载失败", L"curl.exe 报告成功，但无法读取下载的 config.json 文件。");
+        ShowError(L"下载失败", L"curl.exe 报告成功，但无法读取下载的配置文件。");
         return FALSE;
     }
 }
@@ -1208,7 +1223,7 @@ void OpenLogViewerWindow() {
 
 
 // =========================================================================
-// 主函数
+// 主函数 (--- 已按流程图修改 ---)
 // =========================================================================
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int nCmdShow) {
@@ -1306,51 +1321,110 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
         Shell_NotifyIconW(NIM_ADD, &nid);
     }
 
-    // 2. (新增) 显示“正在加载”提示
-    // (--- 移动到 LoadSettings() 之后 ---)
-    // 如果 g_isIconVisible 为 FALSE, ShowTrayTip 内部会直接返回
-    ShowTrayTip(L"请稍候", L"正在获取最新配置文件...");
+    // =========================================================================
+    // (--- 流程图逻辑开始 (严格模式) ---)
+    // =========================================================================
 
-    // 3. (修改) 下载配置文件
-    // (--- 移除硬编码URL, g_configUrl 在 LoadSettings() 中加载 ---)
-    // const wchar_t* configUrl = L"..."; 
     const wchar_t* configPath = L"config.json";
+    const wchar_t* tempConfigPath = L"config.json.tmp";
     
-    // (--- 修改：使用 g_configUrl ---)
-    // (--- 此处实现了下载失败时拒绝启动的功能 ---)
-    if (!DownloadConfig(g_configUrl, configPath)) {
+    // (--- 退出程序的清理宏 ---)
+    #define CLEANUP_AND_EXIT() \
+        do { \
+            if (hMutex) CloseHandle(hMutex); \
+            if (g_hFont) DeleteObject(g_hFont); \
+            if (hLogFont) DeleteObject(hLogFont); \
+            DestroyWindow(hwnd); \
+            PostQuitMessage(1); \
+            return 1; \
+        } while (0)
+
+    // 1. 检查配置地址是否有效 (通过下载到 .tmp 实现)
+    ShowTrayTip(L"请稍候", L"正在检查配置地址有效性...");
+    if (!DownloadConfig(g_configUrl, tempConfigPath)) {
+        // 2. 无效 -> 退出
         // 错误消息已在 DownloadConfig 内部显示
-        if (hMutex) CloseHandle(hMutex);
-        if (g_hFont) DeleteObject(g_hFont);
-        if (hLogFont) DeleteObject(hLogFont);
-        DestroyWindow(hwnd); // 退出前销毁窗口
-        PostQuitMessage(1);  // 退出程序
-        return 1;
+        CLEANUP_AND_EXIT();
     }
-    // --- 修改结束 ---
-    
-    // (--- 调试：修改 ParseTags 失败后的提示 ---)
-    if (!ParseTags()) {
-        MessageBoxW(NULL, L"无法读取或解析下载的 config.json 文件。\n\n请检查：\n1. 下载的文件是否保存在程序目录。\n2. 该文件是否为有效的JSON格式（而不是HTML页面）。", L"JSON 解析失败", MB_OK | MB_ICONERROR);
-        if (hMutex) CloseHandle(hMutex);
-        if (g_hFont) DeleteObject(g_hFont);
-        if (hLogFont) DeleteObject(hLogFont); // 退出前清理
-        DestroyWindow(hwnd); // 退出前销毁窗口
-        PostQuitMessage(1);  // 退出程序
-        return 1;
+
+    // 3. 有效 -> 检查 config.json 是否存在
+    DWORD fileAttr = GetFileAttributesW(configPath);
+    BOOL configExists = (fileAttr != INVALID_FILE_ATTRIBUTES && !(fileAttr & FILE_ATTRIBUTE_DIRECTORY));
+
+    if (configExists) {
+        // --- 路径: 存在 ---
+        ShowTrayTip(L"请稍候", L"正在使用本地配置启动...");
+
+        // 1. 启动核心 (使用旧的 config.json)
+        if (!ParseTags()) { // ParseTags 默认读取 config.json
+            MessageBoxW(NULL, L"无法读取或解析本地 config.json 文件。\n\n请删除 config.json 后重试。", L"本地JSON 解析失败", MB_OK | MB_ICONERROR);
+            DeleteFileW(tempConfigPath); // 清理下载的临时文件
+            CLEANUP_AND_EXIT();
+        }
+        
+        g_isExiting = FALSE;
+        StartSingBox();
+        wcsncpy(nid.szTip, L"程序正在运行 (后台比较配置...)", ARRAYSIZE(nid.szTip) - 1);
+        if(g_isIconVisible) { Shell_NotifyIconW(NIM_MODIFY, &nid); }
+
+        // 2. 下载配置文件 (已在第1步完成, 存为 tempConfigPath)
+
+        // 3. 比较 两次 config.json 大小
+        long oldSize = 0;
+        char* oldBuf = NULL;
+        ReadFileToBuffer(configPath, &oldBuf, &oldSize); // 读取旧文件大小
+        if (oldBuf) free(oldBuf);
+            
+        long newSize = 0;
+        char* newBuf = NULL;
+        ReadFileToBuffer(tempConfigPath, &newBuf, &newSize); // 读取新文件大小
+        if (newBuf) free(newBuf);
+
+        // 4. 检查大小
+        if (newSize > 0 && abs(newSize - oldSize) > 100) {
+            // 5. 相差大于100字节 -> 覆盖
+            if (MoveFileExW(tempConfigPath, configPath, MOVEFILE_REPLACE_EXISTING)) {
+                ShowTrayTip(L"配置已更新", L"检测到新配置，下次启动时生效。");
+            } else {
+                ShowTrayTip(L"更新失败", L"覆盖旧配置失败，请检查权限。");
+                DeleteFileW(tempConfigPath);
+            }
+        } else {
+            // 6. 相差小于100字节 -> 保留
+            DeleteFileW(tempConfigPath);
+        }
+
+    } else {
+        // --- 路径: 不存在 ---
+        ShowTrayTip(L"请稍候", L"未找到本地配置，正在应用下载的配置...");
+
+        // 1. 下载配置文件 (已在第1步完成, 存为 tempConfigPath, 现在移动它)
+        if (!MoveFileExW(tempConfigPath, configPath, MOVEFILE_REPLACE_EXISTING)) {
+             ShowError(L"启动失败", L"无法将下载的配置 (tmp) 重命名为 config.json。");
+             DeleteFileW(tempConfigPath);
+             CLEANUP_AND_EXIT();
+        }
+        
+        // 2. 启动核心
+        if (!ParseTags()) { // ParseTags 默认读取 config.json
+            MessageBoxW(NULL, L"无法读取或解析下载的 config.json 文件。\n\n该文件是否为有效的JSON格式？", L"JSON 解析失败", MB_OK | MB_ICONERROR);
+            CLEANUP_AND_EXIT();
+        }
+        
+        g_isExiting = FALSE;
+        StartSingBox();
     }
-    
-    // (修改) 更新托盘提示为“程序正在运行”
+
+    // (--- 移除清理宏定义 ---)
+    #undef CLEANUP_AND_EXIT
+
+    // =========================================================================
+    // (--- 流程图逻辑结束 ---)
+    // =========================================================================
+
     wcsncpy(nid.szTip, L"程序正在运行...", ARRAYSIZE(nid.szTip) - 1);
-    // (修改) 仅当图标可见时才更新提示
-    if(g_isIconVisible) {
-        Shell_NotifyIconW(NIM_MODIFY, &nid);
-    }
-    
-    // 确保启动前 g_isExiting 为 false
-    g_isExiting = FALSE;
-    StartSingBox();
-    
+    if(g_isIconVisible) { Shell_NotifyIconW(NIM_MODIFY, &nid); }
+
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
         // --- 新增：检查是否是日志窗口的消息 ---
