@@ -7,7 +7,7 @@
  *
  * (Modification): Node switching now targets 'route.final'
  * (Modification): (REMOVED) Node management features (Add/Delete/Update)
- * (NEW): Downloads config.json from 'set.ini' (g_configUrl) on startup.
+ * (NEW): Downloads config from 'set.ini' (g_configUrl) on startup.
  * (Fix): (REMOVED) WinINet, PowerShell, and bitsadmin downloaders.
  * (NEW): Using 'curl.exe' (assumed to be in the same directory) to download.
  * (Modification): (REMOVED) Node converter menu item and functionality.
@@ -21,8 +21,9 @@
  * (Modification): (NEW) Implemented flowchart logic STAGE 2 (Strict):
  * - 1. Check URL validity by downloading to .tmp file first.
  * - 2. If download fails (invalid URL/network), EXIT.
- * - 3. If config.json exists, start core, then compare .tmp file.
- * - 4. If config.json NOT exist, move .tmp to .json, then start core.
+ * - 3. If config exists, start core, then compare .tmp file.
+ * - 4. If config NOT exist, move .tmp to .dat, then start core.
+ * (Modification): (NEW) Config file changed to 'config.dat' in system TEMP directory.
  */
 
 // 必须在包含任何 Windows 头文件之前定义
@@ -105,6 +106,9 @@ UINT g_hotkeyModifiers = 0;
 UINT g_hotkeyVk = 0;
 wchar_t g_iniFilePath[MAX_PATH] = {0};
 wchar_t g_configUrl[2048] = {0}; // (--- 新增：用于存储配置URL ---)
+wchar_t g_configFilePath[MAX_PATH] = {0};   // (--- 新增：配置文件路径 ---)
+wchar_t g_tempConfigFilePath[MAX_PATH] = {0}; // (--- 新增：临时配置文件路径 ---)
+
 
 // --- 重构：新增守护功能全局变量 ---
 HANDLE hMonitorThread = NULL;           // 进程崩溃监控线程
@@ -387,7 +391,7 @@ void OpenSettingsWindow() {
 }
 
 // =========================================================================
-// (已修改) 解析 config.json 以获取节点列表和当前节点 (读取 route.final)
+// (已修改) 解析 config.dat 以获取节点列表和当前节点 (读取 route.final)
 // =========================================================================
 BOOL ParseTags() {
     CleanupDynamicNodes();
@@ -395,7 +399,7 @@ BOOL ParseTags() {
     httpPort = 0;
     char* buffer = NULL;
     long size = 0;
-    if (!ReadFileToBuffer(L"config.json", &buffer, &size)) {
+    if (!ReadFileToBuffer(g_configFilePath, &buffer, &size)) { // (--- 修改: 使用全局路径 ---)
         return FALSE;
     }
     cJSON* root = cJSON_Parse(buffer);
@@ -582,9 +586,8 @@ void StartSingBox() {
     si.hStdOutput = hPipe_Wr_Local;
     si.hStdError = hPipe_Wr_Local;
 
-    wchar_t cmdLine[MAX_PATH];
-    wcsncpy(cmdLine, L"sing-box.exe run -c config.json", ARRAYSIZE(cmdLine));
-    cmdLine[ARRAYSIZE(cmdLine) - 1] = L'\0';
+    wchar_t cmdLine[MAX_PATH + 100]; // (--- 增大缓冲区 ---)
+    wsprintfW(cmdLine, L"sing-box.exe run -c \"%s\"", g_configFilePath); // (--- 修改: 使用全局路径 ---)
 
     if (!CreateProcessW(NULL, cmdLine, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         ShowError(L"核心程序启动失败", L"无法创建 sing-box.exe 进程。");
@@ -611,7 +614,7 @@ void StartSingBox() {
         }
 
         wchar_t fullMessage[8192];
-        wsprintfW(fullMessage, L"sing-box.exe 核心程序启动后立即退出。\n\n可能的原因:\n- 配置文件(config.json)格式错误\n- 核心文件损坏或不兼容\n\n核心程序输出:\n%s", errorOutput);
+        wsprintfW(fullMessage, L"sing-box.exe 核心程序启动后立即退出。\n\n可能的原因:\n- 配置文件(config.dat)格式错误\n- 核心文件损坏或不兼容\n\n核心程序输出:\n%s", errorOutput); // (--- 修改: .json -> .dat ---)
         ShowError(L"核心程序启动失败", fullMessage);
         
         CloseHandle(pi.hProcess);
@@ -749,13 +752,13 @@ BOOL IsSystemProxyEnabled() {
 }
 
 // =========================================================================
-// (已修改) 安全地修改 config.json 中的路由 (修改 route.final)
+// (已修改) 安全地修改 config.dat 中的路由 (修改 route.final)
 // =========================================================================
 void SafeReplaceOutbound(const wchar_t* newTag) {
     char* buffer = NULL;
     long size = 0;
-    if (!ReadFileToBuffer(L"config.json", &buffer, &size)) {
-        MessageBoxW(NULL, L"无法打开 config.json", L"错误", MB_OK | MB_ICONERROR);
+    if (!ReadFileToBuffer(g_configFilePath, &buffer, &size)) { // (--- 修改: 使用全局路径 ---)
+        MessageBoxW(NULL, L"无法打开 config.dat", L"错误", MB_OK | MB_ICONERROR); // (--- 修改: .json -> .dat ---)
         return;
     }
     int mbLen = WideCharToMultiByte(CP_UTF8, 0, newTag, -1, NULL, 0, NULL, NULL);
@@ -791,7 +794,7 @@ void SafeReplaceOutbound(const wchar_t* newTag) {
 
     if (newContent) {
         FILE* out = NULL;
-        if (_wfopen_s(&out, L"config.json", L"wb") == 0 && out != NULL) {
+        if (_wfopen_s(&out, g_configFilePath, L"wb") == 0 && out != NULL) { // (--- 修改: 使用全局路径 ---)
             fwrite(newContent, 1, strlen(newContent), out);
             fclose(out);
         }
@@ -1005,9 +1008,10 @@ BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
         return FALSE;
     }
 
-    // 4. 获取 config.json 的绝对路径
+    // 4. 获取 config.dat 的绝对路径
+    // (--- 修改：savePath 已经是完整路径，但 GetFullPathNameW 仍然有用 ---)
     if (GetFullPathNameW(savePath, MAX_PATH, fullSavePath, NULL) == 0) {
-        ShowError(L"下载失败", L"无法获取配置文件的绝对路径。");
+        ShowError(L"下载失败", L"无法验证配置文件的绝对路径。");
         return FALSE;
     }
 
@@ -1080,7 +1084,7 @@ BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
         // 文件存在且大小不为0，视为成功
         return TRUE; 
     } else {
-        ShowError(L"下载失败", L"curl.exe 报告成功，但无法读取下载的配置文件。");
+        ShowError(L"下载失败", L"curl.exe 报告成功，但无法读取下载的临时配置文件。"); // (--- 修改: .json -> 临时配置文件 ---)
         return FALSE;
     }
 }
@@ -1201,7 +1205,7 @@ void OpenLogViewerWindow() {
 
     hLogViewerWnd = CreateWindowExW(
         0, LOGVIEWER_CLASS_NAME, L"Sing-box 实时日志",
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE, // (--- 修正: 拼写错误 ---)
         CW_USEDEFAULT, CW_USEDEFAULT, 700, 450,
         hwnd, // 父窗口设为主窗口，以便管理
         NULL, wc.hInstance, NULL
@@ -1271,6 +1275,29 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     } else {
         wcsncpy(g_iniFilePath, L"set.ini", MAX_PATH - 1);
     }
+    
+    // (--- 退出程序的清理宏 ---)
+    #define CLEANUP_AND_EXIT() \
+        do { \
+            if (hMutex) CloseHandle(hMutex); \
+            if (g_hFont) DeleteObject(g_hFont); \
+            if (hLogFont) DeleteObject(hLogFont); \
+            if (hwnd) DestroyWindow(hwnd); \
+            PostQuitMessage(1); \
+            return 1; \
+        } while (0)
+
+    // (--- 新增：获取临时目录并设置配置文件路径 ---)
+    wchar_t tempPathBuffer[MAX_PATH];
+    DWORD tempPathLen = GetTempPathW(MAX_PATH, tempPathBuffer);
+    if (tempPathLen == 0 || tempPathLen > MAX_PATH) {
+        ShowError(L"启动失败", L"无法获取系统临时目录 (TEMP) 路径。");
+        CLEANUP_AND_EXIT();
+    }
+    wsprintfW(g_configFilePath, L"%sconfig.dat", tempPathBuffer);
+    wsprintfW(g_tempConfigFilePath, L"%sconfig.dat.tmp", tempPathBuffer);
+    // --- (新增结束) ---
+
 
     // --- (修改) 启动逻辑 ---
     
@@ -1325,40 +1352,32 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     // (--- 流程图逻辑开始 (严格模式) ---)
     // =========================================================================
 
-    const wchar_t* configPath = L"config.json";
-    const wchar_t* tempConfigPath = L"config.json.tmp";
+    // (--- 路径已在上方设为全局变量 g_configFilePath 和 g_tempConfigFilePath ---)
     
-    // (--- 退出程序的清理宏 ---)
-    #define CLEANUP_AND_EXIT() \
-        do { \
-            if (hMutex) CloseHandle(hMutex); \
-            if (g_hFont) DeleteObject(g_hFont); \
-            if (hLogFont) DeleteObject(hLogFont); \
-            DestroyWindow(hwnd); \
-            PostQuitMessage(1); \
-            return 1; \
-        } while (0)
-
     // 1. 检查配置地址是否有效 (通过下载到 .tmp 实现)
     ShowTrayTip(L"请稍候", L"正在检查配置地址有效性...");
-    if (!DownloadConfig(g_configUrl, tempConfigPath)) {
+    if (!DownloadConfig(g_configUrl, g_tempConfigFilePath)) { // (--- 修改: 使用全局路径 ---)
         // 2. 无效 -> 退出
         // 错误消息已在 DownloadConfig 内部显示
         CLEANUP_AND_EXIT();
     }
 
-    // 3. 有效 -> 检查 config.json 是否存在
-    DWORD fileAttr = GetFileAttributesW(configPath);
+    // 3. 有效 -> 检查 config.dat 是否存在
+    DWORD fileAttr = GetFileAttributesW(g_configFilePath); // (--- 修改: 使用全局路径 ---)
     BOOL configExists = (fileAttr != INVALID_FILE_ATTRIBUTES && !(fileAttr & FILE_ATTRIBUTE_DIRECTORY));
 
     if (configExists) {
         // --- 路径: 存在 ---
         ShowTrayTip(L"请稍候", L"正在使用本地配置启动...");
 
-        // 1. 启动核心 (使用旧的 config.json)
-        if (!ParseTags()) { // ParseTags 默认读取 config.json
-            MessageBoxW(NULL, L"无法读取或解析本地 config.json 文件。\n\n请删除 config.json 后重试。", L"本地JSON 解析失败", MB_OK | MB_ICONERROR);
-            DeleteFileW(tempConfigPath); // 清理下载的临时文件
+        // 1. 启动核心 (使用旧的 config.dat)
+        if (!ParseTags()) { // ParseTags 默认读取 g_configFilePath
+            // (--- 修正: MessageBoxW 不支持格式化字符串 ---)
+            wchar_t errorMsg[MAX_PATH + 256];
+            wsprintfW(errorMsg, L"无法读取或解析本地 config.dat 文件。\n\n请删除 %s 后重试。", g_configFilePath);
+            MessageBoxW(NULL, errorMsg, L"本地配置解析失败", MB_OK | MB_ICONERROR); 
+            // (--- 修正结束 ---)
+            DeleteFileW(g_tempConfigFilePath); // 清理下载的临时文件
             CLEANUP_AND_EXIT();
         }
         
@@ -1367,47 +1386,47 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
         wcsncpy(nid.szTip, L"程序正在运行 (后台比较配置...)", ARRAYSIZE(nid.szTip) - 1);
         if(g_isIconVisible) { Shell_NotifyIconW(NIM_MODIFY, &nid); }
 
-        // 2. 下载配置文件 (已在第1步完成, 存为 tempConfigPath)
+        // 2. 下载配置文件 (已在第1步完成, 存为 g_tempConfigFilePath)
 
-        // 3. 比较 两次 config.json 大小
+        // 3. 比较 两次 config.dat 大小
         long oldSize = 0;
         char* oldBuf = NULL;
-        ReadFileToBuffer(configPath, &oldBuf, &oldSize); // 读取旧文件大小
+        ReadFileToBuffer(g_configFilePath, &oldBuf, &oldSize); // 读取旧文件大小
         if (oldBuf) free(oldBuf);
             
         long newSize = 0;
         char* newBuf = NULL;
-        ReadFileToBuffer(tempConfigPath, &newBuf, &newSize); // 读取新文件大小
+        ReadFileToBuffer(g_tempConfigFilePath, &newBuf, &newSize); // 读取新文件大小
         if (newBuf) free(newBuf);
 
         // 4. 检查大小
         if (newSize > 0 && abs(newSize - oldSize) > 100) {
             // 5. 相差大于100字节 -> 覆盖
-            if (MoveFileExW(tempConfigPath, configPath, MOVEFILE_REPLACE_EXISTING)) {
+            if (MoveFileExW(g_tempConfigFilePath, g_configFilePath, MOVEFILE_REPLACE_EXISTING)) { // (--- 修改: 使用全局路径 ---)
                 ShowTrayTip(L"配置已更新", L"检测到新配置，下次启动时生效。");
             } else {
                 ShowTrayTip(L"更新失败", L"覆盖旧配置失败，请检查权限。");
-                DeleteFileW(tempConfigPath);
+                DeleteFileW(g_tempConfigFilePath); // (--- 修改: 使用全局路径 ---)
             }
         } else {
             // 6. 相差小于100字节 -> 保留
-            DeleteFileW(tempConfigPath);
+            DeleteFileW(g_tempConfigFilePath); // (--- 修改: 使用全局路径 ---)
         }
 
     } else {
         // --- 路径: 不存在 ---
         ShowTrayTip(L"请稍候", L"未找到本地配置，正在应用下载的配置...");
 
-        // 1. 下载配置文件 (已在第1步完成, 存为 tempConfigPath, 现在移动它)
-        if (!MoveFileExW(tempConfigPath, configPath, MOVEFILE_REPLACE_EXISTING)) {
-             ShowError(L"启动失败", L"无法将下载的配置 (tmp) 重命名为 config.json。");
-             DeleteFileW(tempConfigPath);
+        // 1. 下载配置文件 (已在第1步完成, 存为 g_tempConfigFilePath, 现在移动它)
+        if (!MoveFileExW(g_tempConfigFilePath, g_configFilePath, MOVEFILE_REPLACE_EXISTING)) { // (--- 修改: 使用全局路径 ---)
+             ShowError(L"启动失败", L"无法将下载的配置 (tmp) 重命名为 config.dat。");
+             DeleteFileW(g_tempConfigFilePath); // (--- 修改: 使用全局路径 ---)
              CLEANUP_AND_EXIT();
         }
         
         // 2. 启动核心
-        if (!ParseTags()) { // ParseTags 默认读取 config.json
-            MessageBoxW(NULL, L"无法读取或解析下载的 config.json 文件。\n\n该文件是否为有效的JSON格式？", L"JSON 解析失败", MB_OK | MB_ICONERROR);
+        if (!ParseTags()) { // ParseTags 默认读取 g_configFilePath
+            MessageBoxW(NULL, L"无法读取或解析下载的 config.dat 文件。\n\n该文件是否为有效的JSON格式？", L"配置解析失败", MB_OK | MB_ICONERROR); // (--- 修改: .json -> .dat ---)
             CLEANUP_AND_EXIT();
         }
         
@@ -1451,7 +1470,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     
     // --- 新增：清理字体 ---
     if (hLogFont) DeleteObject(hLogFont);
-    // --- 新增结束 ---
+    // --- 新N增结束 ---
     
     if (g_hFont) DeleteObject(g_hFont);
     return (int)msg.wParam;
