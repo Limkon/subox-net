@@ -14,16 +14,11 @@
  * (Fix): Using absolute path for curl.exe and launching it directly.
  * (Fix): Added -k (insecure) flag to curl to bypass SSL/TLS verification.
  * (Modification): (REMOVED) Icon load failure warning.
- * (Modification): (NEW) Show "Loading config..." tip on tray icon during download.
- * (Fix): Moved LoadSettings() to before tray icon creation to respect g_isIconVisible on startup.
  * (Modification): (REMOVED) Automatic node switching feature.
  * (Modification): (NEW) Config download URL is now read from set.ini [Settings] ConfigUrl.
- * (Modification): (NEW) Implemented flowchart logic STAGE 2 (Strict):
- * - 1. Check URL validity by downloading to .tmp file first.
- * - 2. If download fails (invalid URL/network), EXIT.
- * - 3. If config exists, start core, then compare .tmp file.
- * - 4. If config NOT exist, move .tmp to .dat, then start core.
+ * (Modification): (NEW) Implemented flowchart logic STAGE 2 (Strict)
  * (Modification): (NEW) Config file changed to 'config.dat' in system TEMP directory.
+ * (Modification): (--- 优化 ---) 启动逻辑异步化 (InitThread)，防止UI卡顿。
  */
 
 // 必须在包含任何 Windows 头文件之前定义
@@ -64,6 +59,7 @@ static const GUID APP_GUID = { 0xbfd8a583, 0x662a, 0x4fe3, { 0x97, 0x84, 0xfa, 0
 #define WM_SINGBOX_CRASHED (WM_USER + 2)     // 消息：核心进程崩溃
 // #define WM_SINGBOX_RECONNECT (WM_USER + 3)   // (已移除) 自动切换
 #define WM_LOG_UPDATE (WM_USER + 3)          // 消息：日志线程发送新的日志文本 (值已调整)
+#define WM_INIT_COMPLETE (WM_USER + 5)       // (--- 新增：初始化线程完成消息 ---)
 
 #define ID_TRAY_EXIT 1001
 #define ID_TRAY_AUTORUN 1002
@@ -646,7 +642,6 @@ void StartSingBox() {
     // 它由 StopSingBox 统一关闭
 }
 // --- 重构结束 ---
-
 void SwitchNode(const wchar_t* tag) {
     SafeReplaceOutbound(tag);
     wcsncpy(currentNode, tag, ARRAYSIZE(currentNode) - 1);
@@ -893,6 +888,30 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         ShowTrayTip(L"Sing-box 监控", L"核心进程意外终止。请手动检查。");
     }
     // (--- 已移除 WM_SINGBOX_RECONNECT (自动切换) 的处理 ---)
+    
+    // (--- 新增：处理初始化完成消息 ---)
+    else if (msg == WM_INIT_COMPLETE) {
+        BOOL success = (BOOL)wParam; // 成功标志在 wParam 中
+        if (success) {
+            // 启动成功
+            // 此时 InitThread 中的 ParseTags 已经确保 nodeTags 和 currentNode 是最新的
+            // (--- 优化：我们可以在此再次调用 ParseTags() 以确保菜单数据绝对同步 ---)
+            ParseTags();
+            
+            // 更新托盘提示
+            wcsncpy(nid.szTip, L"程序正在运行...", ARRAYSIZE(nid.szTip) - 1);
+            if(g_isIconVisible) { Shell_NotifyIconW(NIM_MODIFY, &nid); }
+            
+            ShowTrayTip(L"启动成功", L"程序已准备就绪。");
+
+        } else {
+            // 启动失败，InitThread 已经显示了错误 MessageBox
+            ShowTrayTip(L"启动失败", L"核心初始化失败，程序将退出。");
+            
+            // 发送退出消息关闭程序
+            PostMessageW(hWnd, WM_COMMAND, ID_TRAY_EXIT, 0);
+        }
+    }
     // --- 重构结束 ---
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
@@ -1158,6 +1177,7 @@ LRESULT CALLBACK LogViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
             // 用户点击关闭时，只隐藏窗口，不销毁
             // 这样下次打开时，日志历史还在
             ShowWindow(hWnd, SW_HIDE);
+            // (--- 修正：标记为 NULL，以便 OpenLogViewerWindow 知道需要重新创建 ---)
             hLogViewerWnd = NULL; // 标记为“已关闭”
             break;
         }
@@ -1203,9 +1223,10 @@ void OpenLogViewerWindow() {
         }
     }
 
+    // (--- 修正：hLogViewerWnd 在 WM_CREATE 之前赋值 ---)
     hLogViewerWnd = CreateWindowExW(
         0, LOGVIEWER_CLASS_NAME, L"Sing-box 实时日志",
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE, // (--- 修正: 拼写错误 ---)
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE, 
         CW_USEDEFAULT, CW_USEDEFAULT, 700, 450,
         hwnd, // 父窗口设为主窗口，以便管理
         NULL, wc.hInstance, NULL
@@ -1227,7 +1248,129 @@ void OpenLogViewerWindow() {
 
 
 // =========================================================================
+// (--- 新增：异步初始化工作线程 ---)
+// =========================================================================
+DWORD WINAPI InitThread(LPVOID lpParam) {
+    HWND hWndMain = (HWND)lpParam;
+    
+    // (--- 启动逻辑从 wWinMain 迁移至此 ---)
+    
+    // (--- 宏替换：在线程上下文中，失败时发送消息并退出线程 ---)
+    #define THREAD_CLEANUP_AND_EXIT(success) \
+        do { \
+            PostMessageW(hWndMain, WM_INIT_COMPLETE, (WPARAM)(success), (LPARAM)0); \
+            return (success) ? 0 : 1; \
+        } while (0)
+
+    // (--- 新增：获取临时目录并设置配置文件路径 ---)
+    wchar_t tempPathBuffer[MAX_PATH];
+    DWORD tempPathLen = GetTempPathW(MAX_PATH, tempPathBuffer);
+    if (tempPathLen == 0 || tempPathLen > MAX_PATH) {
+        ShowError(L"启动失败", L"无法获取系统临时目录 (TEMP) 路径。");
+        THREAD_CLEANUP_AND_EXIT(FALSE);
+    }
+    wsprintfW(g_configFilePath, L"%sconfig.dat", tempPathBuffer);
+    wsprintfW(g_tempConfigFilePath, L"%sconfig.dat.tmp", tempPathBuffer);
+    // --- (新增结束) ---
+
+    // =========================================================================
+    // (--- 流程图逻辑开始 (严格模式) ---)
+    // =========================================================================
+    
+    // 1. 检查配置地址是否有效 (通过下载到 .tmp 实现)
+    // (--- ShowTrayTip 必须在主线程中调用，已移至主线程 ---)
+    
+    if (!DownloadConfig(g_configUrl, g_tempConfigFilePath)) {
+        // 2. 无效 -> 退出
+        // 错误消息已在 DownloadConfig 内部显示
+        THREAD_CLEANUP_AND_EXIT(FALSE);
+    }
+
+    // 3. 有效 -> 检查 config.dat 是否存在
+    DWORD fileAttr = GetFileAttributesW(g_configFilePath);
+    BOOL configExists = (fileAttr != INVALID_FILE_ATTRIBUTES && !(fileAttr & FILE_ATTRIBUTE_DIRECTORY));
+
+    if (configExists) {
+        // --- 路径: 存在 ---
+        // (--- ShowTrayTip 必须在主线程中调用 ---)
+
+        // 1. 启动核心 (使用旧的 config.dat)
+        if (!ParseTags()) { // ParseTags 默认读取 g_configFilePath
+            wchar_t errorMsg[MAX_PATH + 256];
+            wsprintfW(errorMsg, L"无法读取或解析本地 config.dat 文件。\n\n请删除 %s 后重试。", g_configFilePath);
+            MessageBoxW(NULL, errorMsg, L"本地配置解析失败", MB_OK | MB_ICONERROR); 
+            DeleteFileW(g_tempConfigFilePath); // 清理下载的临时文件
+            THREAD_CLEANUP_AND_EXIT(FALSE);
+        }
+        
+        g_isExiting = FALSE;
+        StartSingBox();
+
+        // 2. 下载配置文件 (已在第1步完成, 存为 g_tempConfigFilePath)
+
+        // 3. 比较 两次 config.dat 大小
+        long oldSize = 0;
+        char* oldBuf = NULL;
+        ReadFileToBuffer(g_configFilePath, &oldBuf, &oldSize); // 读取旧文件大小
+        if (oldBuf) free(oldBuf);
+            
+        long newSize = 0;
+        char* newBuf = NULL;
+        ReadFileToBuffer(g_tempConfigFilePath, &newBuf, &newSize); // 读取新文件大小
+        if (newBuf) free(newBuf);
+
+        // 4. 检查大小
+        if (newSize > 0 && abs(newSize - oldSize) > 100) {
+            // 5. 相差大于100字节 -> 覆盖
+            if (MoveFileExW(g_tempConfigFilePath, g_configFilePath, MOVEFILE_REPLACE_EXISTING)) {
+                // (--- 覆盖成功，通知主线程 ---)
+                // (--- 注意：ShowTrayTip 不能在此调用，主线程将显示 "启动成功" ---)
+                // (--- 我们可以在主线程的 WM_INIT_COMPLETE 处理器中添加一个 "配置已更新" 的提示 ---)
+            } else {
+                // (--- 覆盖失败，继续使用旧配置 ---)
+                DeleteFileW(g_tempConfigFilePath);
+            }
+        } else {
+            // 6. 相差小于100字节 -> 保留
+            DeleteFileW(g_tempConfigFilePath);
+        }
+
+    } else {
+        // --- 路径: 不存在 ---
+        // (--- ShowTrayTip 必须在主线程中调用 ---)
+
+        // 1. 下载配置文件 (已在第1步完成, 存为 g_tempConfigFilePath, 现在移动它)
+        if (!MoveFileExW(g_tempConfigFilePath, g_configFilePath, MOVEFILE_REPLACE_EXISTING)) {
+             ShowError(L"启动失败", L"无法将下载的配置 (tmp) 重命名为 config.dat。");
+             DeleteFileW(g_tempConfigFilePath);
+             THREAD_CLEANUP_AND_EXIT(FALSE);
+        }
+        
+        // 2. 启动核心
+        if (!ParseTags()) { // ParseTags 默认读取 g_configFilePath
+            MessageBoxW(NULL, L"无法读取或解析下载的 config.dat 文件。\n\n该文件是否为有效的JSON格式？", L"配置解析失败", MB_OK | MB_ICONERROR);
+            THREAD_CLEANUP_AND_EXIT(FALSE);
+        }
+        
+        g_isExiting = FALSE;
+        StartSingBox();
+    }
+
+    // =========================================================================
+    // (--- 流程图逻辑结束 ---)
+    // =========================================================================
+    
+    #undef THREAD_CLEANUP_AND_EXIT
+    
+    // --- 成功：通知主线程 ---
+    PostMessageW(hWndMain, WM_INIT_COMPLETE, (WPARAM)TRUE, (LPARAM)0);
+    return 0;
+}
+
+
+// =========================================================================
 // 主函数 (--- 已按流程图修改 ---)
+// (--- 已重构：异步启动 ---)
 // =========================================================================
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int nCmdShow) {
@@ -1287,23 +1430,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
             return 1; \
         } while (0)
 
-    // (--- 新增：获取临时目录并设置配置文件路径 ---)
-    wchar_t tempPathBuffer[MAX_PATH];
-    DWORD tempPathLen = GetTempPathW(MAX_PATH, tempPathBuffer);
-    if (tempPathLen == 0 || tempPathLen > MAX_PATH) {
-        ShowError(L"启动失败", L"无法获取系统临时目录 (TEMP) 路径。");
-        CLEANUP_AND_EXIT();
-    }
-    wsprintfW(g_configFilePath, L"%sconfig.dat", tempPathBuffer);
-    wsprintfW(g_tempConfigFilePath, L"%sconfig.dat.tmp", tempPathBuffer);
-    // --- (新增结束) ---
-
+    // (--- 移除：路径设置已移至 InitThread ---)
 
     // --- (修改) 启动逻辑 ---
     
     // (--- 新增：提前加载设置 ---)
-    // 必须在注册热键和显示托盘图标之前加载
-    // (--- g_configUrl 将在此处被加载 ---)
     LoadSettings();
 
     // 1. 创建窗口和托盘图标
@@ -1326,7 +1457,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     }
 
     // (--- 移动到 LoadSettings() 之后 ---)
-    // 现在 g_hotkeyVk 和 g_hotkeyModifiers 已经从 set.ini 加载
     if (g_hotkeyVk != 0 || g_hotkeyModifiers != 0) {
         if (!RegisterHotKey(hwnd, ID_GLOBAL_HOTKEY, g_hotkeyModifiers, g_hotkeyVk)) {
             MessageBoxW(NULL, L"注册全局快捷键失败！\n可能已被其他程序占用。", L"快捷键错误", MB_OK | MB_ICONWARNING);
@@ -1343,105 +1473,33 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     nid.szTip[ARRAYSIZE(nid.szTip) - 1] = L'\0';
 
     // (--- 移动到 LoadSettings() 之后 ---)
-    // 现在 g_isIconVisible 已经从 set.ini 加载
     if (g_isIconVisible) {
         Shell_NotifyIconW(NIM_ADD, &nid);
     }
 
     // =========================================================================
-    // (--- 流程图逻辑开始 (严格模式) ---)
+    // (--- 流程图逻辑已移至 InitThread ---)
     // =========================================================================
 
-    // (--- 路径已在上方设为全局变量 g_configFilePath 和 g_tempConfigFilePath ---)
-    
-    // 1. 检查配置地址是否有效 (通过下载到 .tmp 实现)
-    ShowTrayTip(L"请稍候", L"正在检查配置地址有效性...");
-    if (!DownloadConfig(g_configUrl, g_tempConfigFilePath)) { // (--- 修改: 使用全局路径 ---)
-        // 2. 无效 -> 退出
-        // 错误消息已在 DownloadConfig 内部显示
+    // (--- 新增：启动初始化工作线程 ---)
+    HANDLE hInitThread = CreateThread(NULL, 0, InitThread, (LPVOID)hwnd, 0, NULL);
+    if (hInitThread) {
+        // 立即关闭句柄，让线程在完成后自行销毁
+        CloseHandle(hInitThread); 
+    } else {
+        ShowError(L"致命错误", L"无法创建启动线程。");
+        if (g_isIconVisible) Shell_NotifyIconW(NIM_DELETE, &nid);
         CLEANUP_AND_EXIT();
     }
-
-    // 3. 有效 -> 检查 config.dat 是否存在
-    DWORD fileAttr = GetFileAttributesW(g_configFilePath); // (--- 修改: 使用全局路径 ---)
-    BOOL configExists = (fileAttr != INVALID_FILE_ATTRIBUTES && !(fileAttr & FILE_ATTRIBUTE_DIRECTORY));
-
-    if (configExists) {
-        // --- 路径: 存在 ---
-        ShowTrayTip(L"请稍候", L"正在使用本地配置启动...");
-
-        // 1. 启动核心 (使用旧的 config.dat)
-        if (!ParseTags()) { // ParseTags 默认读取 g_configFilePath
-            // (--- 修正: MessageBoxW 不支持格式化字符串 ---)
-            wchar_t errorMsg[MAX_PATH + 256];
-            wsprintfW(errorMsg, L"无法读取或解析本地 config.dat 文件。\n\n请删除 %s 后重试。", g_configFilePath);
-            MessageBoxW(NULL, errorMsg, L"本地配置解析失败", MB_OK | MB_ICONERROR); 
-            // (--- 修正结束 ---)
-            DeleteFileW(g_tempConfigFilePath); // 清理下载的临时文件
-            CLEANUP_AND_EXIT();
-        }
-        
-        g_isExiting = FALSE;
-        StartSingBox();
-        wcsncpy(nid.szTip, L"程序正在运行 (后台比较配置...)", ARRAYSIZE(nid.szTip) - 1);
-        if(g_isIconVisible) { Shell_NotifyIconW(NIM_MODIFY, &nid); }
-
-        // 2. 下载配置文件 (已在第1步完成, 存为 g_tempConfigFilePath)
-
-        // 3. 比较 两次 config.dat 大小
-        long oldSize = 0;
-        char* oldBuf = NULL;
-        ReadFileToBuffer(g_configFilePath, &oldBuf, &oldSize); // 读取旧文件大小
-        if (oldBuf) free(oldBuf);
-            
-        long newSize = 0;
-        char* newBuf = NULL;
-        ReadFileToBuffer(g_tempConfigFilePath, &newBuf, &newSize); // 读取新文件大小
-        if (newBuf) free(newBuf);
-
-        // 4. 检查大小
-        if (newSize > 0 && abs(newSize - oldSize) > 100) {
-            // 5. 相差大于100字节 -> 覆盖
-            if (MoveFileExW(g_tempConfigFilePath, g_configFilePath, MOVEFILE_REPLACE_EXISTING)) { // (--- 修改: 使用全局路径 ---)
-                ShowTrayTip(L"配置已更新", L"检测到新配置，下次启动时生效。");
-            } else {
-                ShowTrayTip(L"更新失败", L"覆盖旧配置失败，请检查权限。");
-                DeleteFileW(g_tempConfigFilePath); // (--- 修改: 使用全局路径 ---)
-            }
-        } else {
-            // 6. 相差小于100字节 -> 保留
-            DeleteFileW(g_tempConfigFilePath); // (--- 修改: 使用全局路径 ---)
-        }
-
-    } else {
-        // --- 路径: 不存在 ---
-        ShowTrayTip(L"请稍候", L"未找到本地配置，正在应用下载的配置...");
-
-        // 1. 下载配置文件 (已在第1步完成, 存为 g_tempConfigFilePath, 现在移动它)
-        if (!MoveFileExW(g_tempConfigFilePath, g_configFilePath, MOVEFILE_REPLACE_EXISTING)) { // (--- 修改: 使用全局路径 ---)
-             ShowError(L"启动失败", L"无法将下载的配置 (tmp) 重命名为 config.dat。");
-             DeleteFileW(g_tempConfigFilePath); // (--- 修改: 使用全局路径 ---)
-             CLEANUP_AND_EXIT();
-        }
-        
-        // 2. 启动核心
-        if (!ParseTags()) { // ParseTags 默认读取 g_configFilePath
-            MessageBoxW(NULL, L"无法读取或解析下载的 config.dat 文件。\n\n该文件是否为有效的JSON格式？", L"配置解析失败", MB_OK | MB_ICONERROR); // (--- 修改: .json -> .dat ---)
-            CLEANUP_AND_EXIT();
-        }
-        
-        g_isExiting = FALSE;
-        StartSingBox();
-    }
-
+    
     // (--- 移除清理宏定义 ---)
     #undef CLEANUP_AND_EXIT
 
     // =========================================================================
-    // (--- 流程图逻辑结束 ---)
+    // (--- 立即进入消息循环，程序保持响应 ---)
     // =========================================================================
 
-    wcsncpy(nid.szTip, L"程序正在运行...", ARRAYSIZE(nid.szTip) - 1);
+    wcsncpy(nid.szTip, L"程序正在启动... (下载配置)", ARRAYSIZE(nid.szTip) - 1);
     if(g_isIconVisible) { Shell_NotifyIconW(NIM_MODIFY, &nid); }
 
     MSG msg;
@@ -1470,7 +1528,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     
     // --- 新增：清理字体 ---
     if (hLogFont) DeleteObject(hLogFont);
-    // --- 新N增结束 ---
+    // --- 新增结束 ---
     
     if (g_hFont) DeleteObject(g_hFont);
     return (int)msg.wParam;
