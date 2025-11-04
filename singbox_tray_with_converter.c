@@ -1,27 +1,3 @@
-/* * singbox_tray_with_converter.c
- * * Refactored version with:
- * 1. Process Crash Monitoring (MonitorThread)
- * 2. Stdout/Stderr Log Monitoring (LogMonitorThread)
- * 3. Robust log buffer parsing
- * 4. Log Viewer Window to display live sing-box output
- *
- * (Modification): Node switching now targets 'route.final'
- * (Modification): (REMOVED) Node management features (Add/Delete/Update)
- * (NEW): Downloads config from 'set.ini' (g_configUrl) on startup.
- * (Fix): (REMOVED) WinINet, PowerShell, and bitsadmin downloaders.
- * (NEW): Using 'curl.exe' (assumed to be in the same directory) to download.
- * (Modification): (REMOVED) Node converter menu item and functionality.
- * (Fix): Using absolute path for curl.exe and launching it directly.
- * (Fix): Added -k (insecure) flag to curl to bypass SSL/TLS verification.
- * (Modification): (REMOVED) Icon load failure warning.
- * (Modification): (REMOVED) Automatic node switching feature.
- * (Modification): (NEW) Config download URL is now read from set.ini [Settings] ConfigUrl.
- * (Modification): (NEW) Implemented flowchart logic STAGE 2 (Strict)
- * (Modification): (NEW) Config file changed to 'config.dat' in system TEMP directory.
- * (Modification): (--- 优化 ---) 启动逻辑异步化 (InitThread)，防止UI卡顿。
- */
-
-// 必须在包含任何 Windows 头文件之前定义
 #define _WIN32_IE 0x0601
 #define __STDC_WANT_LIB_EXT1__ 1
 #define _WIN32_WINNT 0x0601
@@ -33,14 +9,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
-#include <wininet.h> // 仍然需要 WinINet 的宏定义
+#include <wininet.h> 
 #include <commctrl.h>
-#include <time.h> // 用于重启冷却
+#include <time.h> 
 
-// 直接包含源文件以简化 TCC 编译过程
 #include "cJSON.c"
 
-// 为兼容旧版 SDK (如某些 MinGW 版本) 手动添加缺失的宏定义
 #ifndef NIF_GUID
 #define NIF_GUID 0x00000020
 #endif
@@ -49,44 +23,38 @@
 #define NOTIFYICON_VERSION_4 4
 #endif
 
-
-// 定义一个唯一的 GUID，仅用于程序单实例
-// {BFD8A583-662A-4FE3-9784-FAB78A3386A3}
 static const GUID APP_GUID = { 0xbfd8a583, 0x662a, 0x4fe3, { 0x97, 0x84, 0xfa, 0xb7, 0x8a, 0x33, 0x86, 0xa3 } };
 
 
 #define WM_TRAY (WM_USER + 1)
-#define WM_SINGBOX_CRASHED (WM_USER + 2)     // 消息：核心进程崩溃
-// #define WM_SINGBOX_RECONNECT (WM_USER + 3)   // (已移除) 自动切换
-#define WM_LOG_UPDATE (WM_USER + 3)          // 消息：日志线程发送新的日志文本 (值已调整)
-#define WM_INIT_COMPLETE (WM_USER + 5)       // (--- 新增：初始化线程完成消息 ---)
+#define WM_SINGBOX_CRASHED (WM_USER + 2)     
+#define WM_LOG_UPDATE (WM_USER + 3)          
+#define WM_INIT_COMPLETE (WM_USER + 5)       
+#define WM_INIT_LOG (WM_USER + 6)            
 
 #define ID_TRAY_EXIT 1001
 #define ID_TRAY_AUTORUN 1002
 #define ID_TRAY_SYSTEM_PROXY 1003
-// #define ID_TRAY_OPEN_CONVERTER 1004 // (已移除)
 #define ID_TRAY_SETTINGS 1005
-// #define ID_TRAY_MANAGE_NODES 1006 // (已移除)
-#define ID_TRAY_SHOW_CONSOLE 1007 // 新增：显示日志菜单ID
+#define ID_TRAY_SHOW_CONSOLE 1007 
 #define ID_TRAY_NODE_BASE 2000
 
-// (移除了所有节点管理窗口控件ID)
-
-// 日志查看器窗口控件ID
 #define ID_LOGVIEWER_EDIT 6001
 
 #define ID_GLOBAL_HOTKEY 9001
 #define ID_HOTKEY_CTRL 101
 
-// (移除了 IDR_HTML_CONVERTER 和 RT_HTML 的定义)
+typedef struct {
+    HWND hWndMain;
+    BOOL isAutorun;
+} INIT_THREAD_PARAMS;
 
-// 全局变量
 NOTIFYICONDATAW nid;
 HWND hwnd;
 HMENU hMenu, hNodeSubMenu;
 HANDLE hMutex = NULL;
 PROCESS_INFORMATION pi = {0};
-HFONT g_hFont = NULL; // 全局字体句柄
+HFONT g_hFont = NULL; 
 
 wchar_t** nodeTags = NULL;
 int nodeCount = 0;
@@ -96,31 +64,22 @@ int httpPort = 0;
 
 const wchar_t* REG_PATH_PROXY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
 
-// 新增全局变量
 BOOL g_isIconVisible = TRUE;
 UINT g_hotkeyModifiers = 0;
 UINT g_hotkeyVk = 0;
 wchar_t g_iniFilePath[MAX_PATH] = {0};
-wchar_t g_configUrl[2048] = {0}; // (--- 新增：用于存储配置URL ---)
-wchar_t g_configFilePath[MAX_PATH] = {0};   // (--- 新增：配置文件路径 ---)
-wchar_t g_tempConfigFilePath[MAX_PATH] = {0}; // (--- 新增：临时配置文件路径 ---)
+wchar_t g_configUrl[2048] = {0}; 
+wchar_t g_configFilePath[MAX_PATH] = {0};   
+wchar_t g_tempConfigFilePath[MAX_PATH] = {0}; 
 
+HANDLE hMonitorThread = NULL;           
+HANDLE hLogMonitorThread = NULL;        
+HANDLE hChildStd_OUT_Rd_Global = NULL;  
+BOOL g_isExiting = FALSE;               
 
-// --- 重构：新增守护功能全局变量 ---
-HANDLE hMonitorThread = NULL;           // 进程崩溃监控线程
-HANDLE hLogMonitorThread = NULL;        // 进程日志监控线程
-HANDLE hChildStd_OUT_Rd_Global = NULL;  // 核心进程的标准输出管道（读取端）
-BOOL g_isExiting = FALSE;               // 标记是否为用户主动退出/切换
+HWND hLogViewerWnd = NULL; 
+HFONT hLogFont = NULL;     
 
-// --- 新增：日志窗口句柄 ---
-HWND hLogViewerWnd = NULL; // 日志查看器窗口句柄
-HFONT hLogFont = NULL;     // 日志窗口等宽字体
-// --- 重构结束 ---
-
-// (移除了 MODIFY_NODE_PARAMS 结构体)
-
-
-// 函数声明
 void ShowTrayTip(const wchar_t* title, const wchar_t* message);
 void ShowError(const wchar_t* title, const wchar_t* message);
 BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* fileSize);
@@ -143,22 +102,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 void StopSingBox();
 void SetAutorun(BOOL enable);
 BOOL IsAutorunEnabled();
-// (移除了 OpenConverterHtmlFromResource)
 char* ConvertLfToCrlf(const char* input);
-// (移除了 CreateDefaultConfig)
-BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath); // 新增
+BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath); 
 
-// (移除了所有节点管理函数声明)
-
-// --- 重构：新增日志查看器函数声明 ---
 void OpenLogViewerWindow();
 LRESULT CALLBACK LogViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
-// --- 重构结束 ---
 
-
-// 辅助函数
 void ShowTrayTip(const wchar_t* title, const wchar_t* message) {
-    if (!g_isIconVisible) return; // (新增) 如果图标隐藏，则不显示提示
+    if (!g_isIconVisible) return; 
     nid.uFlags = NIF_INFO;
     nid.dwInfoFlags = NIIF_INFO;
     wcsncpy(nid.szInfoTitle, title, ARRAYSIZE(nid.szInfoTitle) - 1);
@@ -199,10 +150,10 @@ BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* fileSize) {
     *fileSize = ftell(f);
     fseek(f, 0, SEEK_SET);
     if (*fileSize <= 0) { 
-        *fileSize = 0; // 确保大小为0
+        *fileSize = 0; 
         *buffer = NULL;
         fclose(f); 
-        return FALSE; // 文件为空也视为失败
+        return FALSE; 
     }
     *buffer = (char*)malloc(*fileSize + 1);
     if (!*buffer) { fclose(f); return FALSE; }
@@ -264,15 +215,12 @@ char* ConvertLfToCrlf(const char* input) {
     return output;
 }
 
-// 快捷键设置功能函数
 void LoadSettings() {
-    // (--- 新增：默认URL ---)
     const wchar_t* defaultConfigUrl = L"";
     
     g_hotkeyModifiers = GetPrivateProfileIntW(L"Settings", L"Modifiers", 0, g_iniFilePath);
     g_hotkeyVk = GetPrivateProfileIntW(L"Settings", L"VK", 0, g_iniFilePath);
     g_isIconVisible = GetPrivateProfileIntW(L"Settings", L"ShowIcon", 1, g_iniFilePath);
-    // (--- 新增：读取URL ---)
     GetPrivateProfileStringW(L"Settings", L"ConfigUrl", defaultConfigUrl, g_configUrl, ARRAYSIZE(g_configUrl), g_iniFilePath);
 }
 
@@ -284,7 +232,6 @@ void SaveSettings() {
     WritePrivateProfileStringW(L"Settings", L"VK", buffer, g_iniFilePath);
     wsprintfW(buffer, L"%d", g_isIconVisible);
     WritePrivateProfileStringW(L"Settings", L"ShowIcon", buffer, g_iniFilePath);
-    // (--- 新增：保存URL ---)
     WritePrivateProfileStringW(L"Settings", L"ConfigUrl", g_configUrl, g_iniFilePath);
 }
 
@@ -323,7 +270,6 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             hOkBtn = CreateWindowW(L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 60, 85, 80, 25, hWnd, (HMENU)IDOK, NULL, NULL);
             hCancelBtn = CreateWindowW(L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE, 160, 85, 80, 25, hWnd, (HMENU)IDCANCEL, NULL, NULL);
 
-            // 应用字体
             SendMessage(hLabel, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessage(hHotkey, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessage(hOkBtn, WM_SETFONT, (WPARAM)g_hFont, TRUE);
@@ -386,16 +332,13 @@ void OpenSettingsWindow() {
     }
 }
 
-// =========================================================================
-// (已修改) 解析 config.dat 以获取节点列表和当前节点 (读取 route.final)
-// =========================================================================
 BOOL ParseTags() {
     CleanupDynamicNodes();
     currentNode[0] = L'\0';
     httpPort = 0;
     char* buffer = NULL;
     long size = 0;
-    if (!ReadFileToBuffer(g_configFilePath, &buffer, &size)) { // (--- 修改: 使用全局路径 ---)
+    if (!ReadFileToBuffer(g_configFilePath, &buffer, &size)) { 
         return FALSE;
     }
     cJSON* root = cJSON_Parse(buffer);
@@ -431,8 +374,6 @@ BOOL ParseTags() {
     }
     cJSON* route = cJSON_GetObjectItem(root, "route");
     if (route) {
-        // (--- 新逻辑 ---)
-        // 直接从 route.final 读取当前节点
         cJSON* final_outbound = cJSON_GetObjectItem(route, "final");
         if (cJSON_IsString(final_outbound) && final_outbound->valuestring) {
             MultiByteToWideChar(CP_UTF8, 0, final_outbound->valuestring, -1, currentNode, ARRAYSIZE(currentNode));
@@ -460,18 +401,11 @@ int GetHttpInboundPort() {
     return httpPort;
 }
 
-
-// --- 重构：新增守护线程函数 ---
-
-// 监视 sing-box 核心进程是否崩溃的线程函数
 DWORD WINAPI MonitorThread(LPVOID lpParam) {
     HANDLE hProcess = (HANDLE)lpParam;
     
-    // 阻塞等待，直到 hProcess 进程终止
     WaitForSingleObject(hProcess, INFINITE);
 
-    // 进程终止后，检查 g_isExiting 标志
-    // 如果不是用户主动退出（g_isExiting == FALSE），则向主窗口发送崩溃消息
     if (!g_isExiting) {
         PostMessageW(hwnd, WM_SINGBOX_CRASHED, 0, 0);
     }
@@ -479,93 +413,66 @@ DWORD WINAPI MonitorThread(LPVOID lpParam) {
     return 0;
 }
 
-// 监视 sing-box 核心进程日志输出的线程函数
 DWORD WINAPI LogMonitorThread(LPVOID lpParam) {
-    char readBuf[4096];      // 原始读取缓冲区
-    char lineBuf[8192] = {0}; // 拼接缓冲区，处理跨Read的日志行
+    char readBuf[4096];      
+    char lineBuf[8192] = {0}; 
     DWORD dwRead;
     BOOL bSuccess;
-    // static time_t lastLogTriggeredRestart = 0; // (已移除自动切换)
-    // const time_t RESTART_COOLDOWN = 60; // (已移除自动切换)
     HANDLE hPipe = (HANDLE)lpParam;
 
     while (TRUE) {
-        // 从管道读取数据
         bSuccess = ReadFile(hPipe, readBuf, sizeof(readBuf) - 1, &dwRead, NULL);
         
         if (!bSuccess || dwRead == 0) {
-            // 管道被破坏或关闭 (例如，sing-box 被终止)
-            break; // 线程退出
+            break; 
         }
 
-        // 确保缓冲区以NULL结尾
         readBuf[dwRead] = '\0';
 
-        // --- 新增：转发日志到查看器窗口 ---
         if (hLogViewerWnd != NULL && !g_isExiting) {
             int wideLen = MultiByteToWideChar(CP_UTF8, 0, readBuf, -1, NULL, 0);
             if (wideLen > 0) {
-                // 为 wchar_t* 分配内存
                 wchar_t* pWideBuf = (wchar_t*)malloc(wideLen * sizeof(wchar_t));
                 if (pWideBuf) {
                     MultiByteToWideChar(CP_UTF8, 0, readBuf, -1, pWideBuf, wideLen);
                     
-                    // 异步发送消息，将内存指针作为lParam传递
-                    // 日志窗口的UI线程将负责 free(pWideBuf)
                     if (!PostMessageW(hLogViewerWnd, WM_LOG_UPDATE, 0, (LPARAM)pWideBuf)) {
-                        // 如果PostMessage失败（例如窗口正在关闭），我们必须在这里释放内存
                         free(pWideBuf);
                     }
                 }
             }
         }
-        // --- 新增结束 ---
 
-
-        // 将新读取的数据附加到行缓冲区
         strncat(lineBuf, readBuf, sizeof(lineBuf) - strlen(lineBuf) - 1);
 
-        // 如果我们正在退出或切换，不要解析日志
         if (g_isExiting) {
             continue;
         }
 
-        // --- 关键词分析 ---
-        // (--- 已移除 ---) 自动切换节点的错误检测 (fatal, dial, timeout, refused)
-        
-        // 我们需要清理缓冲区，只保留最后一行（可能是半行）
         char* last_newline = strrchr(lineBuf, '\n');
         if (last_newline != NULL) {
-            // 找到了换行符，只保留换行符之后的内容
             strcpy(lineBuf, last_newline + 1);
         } else if (strlen(lineBuf) > 4096) {
-            // 缓冲区已满但没有换行符（异常情况），清空它以防溢出
             lineBuf[0] = '\0';
         }
-        // 如果没有换行符且缓冲区未满，则不执行任何操作，等待下一次 ReadFile 拼接
     }
     
     return 0;
 }
-// --- 重构结束 ---
 
-
-// --- 重构：修改 StartSingBox ---
 void StartSingBox() {
-    HANDLE hPipe_Rd_Local = NULL; // 管道读取端（本地）
-    HANDLE hPipe_Wr_Local = NULL; // 管道写入端（本地）
+    HANDLE hPipe_Rd_Local = NULL; 
+    HANDLE hPipe_Wr_Local = NULL; 
     SECURITY_ATTRIBUTES sa;
 
     sa.nLength = sizeof(SECURITY_ATTRIBUTES);
     sa.bInheritHandle = TRUE;
     sa.lpSecurityDescriptor = NULL;
 
-    // 创建用于 stdout/stderr 的管道
     if (!CreatePipe(&hPipe_Rd_Local, &hPipe_Wr_Local, &sa, 0)) {
         ShowError(L"管道创建失败", L"无法为核心程序创建输出管道。");
         return;
     }
-    // 确保管道的读取句柄不能被子进程继承
     if (!SetHandleInformation(hPipe_Rd_Local, HANDLE_FLAG_INHERIT, 0)) {
         ShowError(L"管道句柄属性设置失败", L"无法设置输出管道读取句柄的属性。");
         CloseHandle(hPipe_Rd_Local);
@@ -573,7 +480,6 @@ void StartSingBox() {
         return;
     }
 
-    // 将本地读取句柄保存到全局变量，以便日志线程使用
     hChildStd_OUT_Rd_Global = hPipe_Rd_Local;
 
     STARTUPINFOW si = { sizeof(si) };
@@ -582,52 +488,44 @@ void StartSingBox() {
     si.hStdOutput = hPipe_Wr_Local;
     si.hStdError = hPipe_Wr_Local;
 
-    wchar_t cmdLine[MAX_PATH + 100]; // (--- 增大缓冲区 ---)
-    wsprintfW(cmdLine, L"sing-box.exe run -c \"%s\"", g_configFilePath); // (--- 修改: 使用全局路径 ---)
+    wchar_t cmdLine[MAX_PATH + 100]; 
+    wsprintfW(cmdLine, L"sing-box.exe run -c \"%s\"", g_configFilePath); 
 
     if (!CreateProcessW(NULL, cmdLine, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         ShowError(L"核心程序启动失败", L"无法创建 sing-box.exe 进程。");
         ZeroMemory(&pi, sizeof(pi));
-        CloseHandle(hChildStd_OUT_Rd_Global); // 清理全局句柄
+        CloseHandle(hChildStd_OUT_Rd_Global); 
         hChildStd_OUT_Rd_Global = NULL;
         CloseHandle(hPipe_Wr_Local);
         return;
     }
 
-    // 子进程已继承写入句柄，我们不再需要它
     CloseHandle(hPipe_Wr_Local);
 
-    // 检查核心是否在500ms内立即退出（通常是配置错误）
     if (WaitForSingleObject(pi.hProcess, 500) == WAIT_OBJECT_0) {
         char chBuf[4096] = {0};
         DWORD dwRead = 0;
         wchar_t errorOutput[4096] = L"";
 
-        // 从管道读取初始错误输出
         if (ReadFile(hChildStd_OUT_Rd_Global, chBuf, sizeof(chBuf) - 1, &dwRead, NULL) && dwRead > 0) {
             chBuf[dwRead] = '\0';
             MultiByteToWideChar(CP_UTF8, 0, chBuf, -1, errorOutput, ARRAYSIZE(errorOutput));
         }
 
         wchar_t fullMessage[8192];
-        wsprintfW(fullMessage, L"sing-box.exe 核心程序启动后立即退出。\n\n可能的原因:\n- 配置文件(config.dat)格式错误\n- 核心文件损坏或不兼容\n\n核心程序输出:\n%s", errorOutput); // (--- 修改: .json -> .dat ---)
+        wsprintfW(fullMessage, L"sing-box.exe 核心程序启动后立即退出。\n\n可能的原因:\n- 配置文件(config.dat)格式错误\n- 核心文件损坏或不兼容\n\n核心程序输出:\n%s", errorOutput); 
         ShowError(L"核心程序启动失败", fullMessage);
         
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         ZeroMemory(&pi, sizeof(pi));
         
-        CloseHandle(hChildStd_OUT_Rd_Global); // 清理管道
+        CloseHandle(hChildStd_OUT_Rd_Global); 
         hChildStd_OUT_Rd_Global = NULL;
     } 
     else {
-        // --- 进程启动成功，启动监控线程 ---
-
-        // 1. 启动崩溃监控线程
         hMonitorThread = CreateThread(NULL, 0, MonitorThread, pi.hProcess, 0, NULL);
         
-        // 2. 启动日志监控线程
-        // 我们必须复制管道句柄，因为 LogMonitorThread 会在退出时关闭它
         HANDLE hPipeForLogThread;
         if (DuplicateHandle(GetCurrentProcess(), hChildStd_OUT_Rd_Global,
                            GetCurrentProcess(), &hPipeForLogThread, 0,
@@ -635,23 +533,16 @@ void StartSingBox() {
         {
             hLogMonitorThread = CreateThread(NULL, 0, LogMonitorThread, hPipeForLogThread, 0, NULL);
         }
-        // --- 监控启动完毕 ---
     }
-
-    // 注意：我们 *不* 在这里关闭 hChildStd_OUT_Rd_Global
-    // 它由 StopSingBox 统一关闭
 }
-// --- 重构结束 ---
 void SwitchNode(const wchar_t* tag) {
     SafeReplaceOutbound(tag);
     wcsncpy(currentNode, tag, ARRAYSIZE(currentNode) - 1);
     currentNode[ARRAYSIZE(currentNode)-1] = L'\0';
     
-    // --- 重构：添加退出标志 ---
-    g_isExiting = TRUE; // 标记为主动操作，防止监控线程误报
+    g_isExiting = TRUE; 
     StopSingBox();
-    g_isExiting = FALSE; // 清除标志，准备重启
-    // --- 重构结束 ---
+    g_isExiting = FALSE; 
 
     StartSingBox();
     wchar_t message[256];
@@ -746,14 +637,11 @@ BOOL IsSystemProxyEnabled() {
     return isEnabled;
 }
 
-// =========================================================================
-// (已修改) 安全地修改 config.dat 中的路由 (修改 route.final)
-// =========================================================================
 void SafeReplaceOutbound(const wchar_t* newTag) {
     char* buffer = NULL;
     long size = 0;
-    if (!ReadFileToBuffer(g_configFilePath, &buffer, &size)) { // (--- 修改: 使用全局路径 ---)
-        MessageBoxW(NULL, L"无法打开 config.dat", L"错误", MB_OK | MB_ICONERROR); // (--- 修改: .json -> .dat ---)
+    if (!ReadFileToBuffer(g_configFilePath, &buffer, &size)) { 
+        MessageBoxW(NULL, L"无法打开 config.dat", L"错误", MB_OK | MB_ICONERROR); 
         return;
     }
     int mbLen = WideCharToMultiByte(CP_UTF8, 0, newTag, -1, NULL, 0, NULL, NULL);
@@ -770,17 +658,12 @@ void SafeReplaceOutbound(const wchar_t* newTag) {
         return;
     }
 
-    // (--- 已修改 ---)
     cJSON* route = cJSON_GetObjectItem(root, "route");
     if (route) {
-        // (--- 新逻辑 ---)
-        // 直接修改 route.final
         cJSON* final_outbound = cJSON_GetObjectItem(route, "final");
         if (final_outbound) {
             cJSON_SetValuestring(final_outbound, newTagMb);
         } else {
-            // (--- 备用逻辑 ---)
-            // 如果 "final" 字段不存在，则创建它
             cJSON_AddItemToObject(route, "final", cJSON_CreateString(newTagMb));
         }
     }
@@ -789,7 +672,7 @@ void SafeReplaceOutbound(const wchar_t* newTag) {
 
     if (newContent) {
         FILE* out = NULL;
-        if (_wfopen_s(&out, g_configFilePath, L"wb") == 0 && out != NULL) { // (--- 修改: 使用全局路径 ---)
+        if (_wfopen_s(&out, g_configFilePath, L"wb") == 0 && out != NULL) { 
             fwrite(newContent, 1, strlen(newContent), out);
             fclose(out);
         }
@@ -799,7 +682,6 @@ void SafeReplaceOutbound(const wchar_t* newTag) {
     free(buffer);
     free(newTagMb);
 }
-// --- 重构：修改 UpdateMenu (移除管理节点) ---
 void UpdateMenu() {
     if (hMenu) DestroyMenu(hMenu);
     if (hNodeSubMenu) DestroyMenu(hNodeSubMenu);
@@ -811,25 +693,19 @@ void UpdateMenu() {
         AppendMenuW(hNodeSubMenu, flags, ID_TRAY_NODE_BASE + i, nodeTags[i]);
     }
     AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hNodeSubMenu, L"切换节点");
-    // (移除了 "管理节点" 菜单项)
-    // (移除了 "节点转换" 菜单项)
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_AUTORUN, L"开机启动");
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_SYSTEM_PROXY, L"系统代理");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_SETTINGS, L"隐藏图标");
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_SHOW_CONSOLE, L"显示日志"); // 新增
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_SHOW_CONSOLE, L"显示日志"); 
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"退出");
 }
-// --- 重构结束 ---
 
-
-// --- 重构：修改 WndProc (移除自动切换节点, 移除管理节点) ---
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    // 自动重启的冷却计时器
     static time_t lastAutoRestart = 0;
-    const time_t RESTART_COOLDOWN = 60; // 60秒 (保留定义，用于崩溃提示)
+    const time_t RESTART_COOLDOWN = 60; 
 
     if (msg == WM_TRAY && (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU)) {
         POINT pt;
@@ -846,13 +722,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         int id = LOWORD(wParam);
         if (id == ID_TRAY_EXIT) {
             
-            g_isExiting = TRUE; // 标记为主动退出
+            g_isExiting = TRUE; 
 
-            // --- 新增：销毁日志窗口 ---
             if (hLogViewerWnd != NULL) {
                 DestroyWindow(hLogViewerWnd);
             }
-            // --- 新增结束 ---
 
             UnregisterHotKey(hWnd, ID_GLOBAL_HOTKEY);
             if(g_isIconVisible) Shell_NotifyIconW(NIM_DELETE, &nid);
@@ -867,12 +741,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SetSystemProxy(!isEnabled);
             ShowTrayTip(L"系统代理", isEnabled ? L"系统代理已关闭" : L"系统代理已开启");
         } 
-        // (移除了 ID_TRAY_OPEN_CONVERTER 的 else if)
         else if (id == ID_TRAY_SETTINGS) {
             OpenSettingsWindow();
         } 
-        // (移除了 ID_TRAY_MANAGE_NODES 的 else if)
-        else if (id == ID_TRAY_SHOW_CONSOLE) { // --- 新增：处理日志窗口 ---
+        else if (id == ID_TRAY_SHOW_CONSOLE) { 
             OpenLogViewerWindow();
         } else if (id >= ID_TRAY_NODE_BASE && id < ID_TRAY_NODE_BASE + nodeCount) {
             SwitchNode(nodeTags[id - ID_TRAY_NODE_BASE]);
@@ -882,46 +754,41 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ToggleTrayIconVisibility();
         }
     }
-    // --- 重构：处理核心崩溃或日志错误 (已移除自动切换) ---
     else if (msg == WM_SINGBOX_CRASHED) {
-        // 核心崩溃，只提示，不自动操作
         ShowTrayTip(L"Sing-box 监控", L"核心进程意外终止。请手动检查。");
     }
-    // (--- 已移除 WM_SINGBOX_RECONNECT (自动切换) 的处理 ---)
     
-    // (--- 新增：处理初始化完成消息 ---)
+    else if (msg == WM_INIT_LOG) {
+        if (hLogViewerWnd != NULL) {
+            if (!PostMessageW(hLogViewerWnd, WM_LOG_UPDATE, 0, lParam)) {
+                free((void*)lParam);
+            }
+        } else {
+            free((void*)lParam);
+        }
+    }
+    
     else if (msg == WM_INIT_COMPLETE) {
-        BOOL success = (BOOL)wParam; // 成功标志在 wParam 中
+        BOOL success = (BOOL)wParam; 
         if (success) {
-            // 启动成功
-            // 此时 InitThread 中的 ParseTags 已经确保 nodeTags 和 currentNode 是最新的
-            // (--- 优化：我们可以在此再次调用 ParseTags() 以确保菜单数据绝对同步 ---)
             ParseTags();
             
-            // 更新托盘提示
             wcsncpy(nid.szTip, L"程序正在运行...", ARRAYSIZE(nid.szTip) - 1);
             if(g_isIconVisible) { Shell_NotifyIconW(NIM_MODIFY, &nid); }
             
             ShowTrayTip(L"启动成功", L"程序已准备就绪。");
 
         } else {
-            // 启动失败，InitThread 已经显示了错误 MessageBox
             ShowTrayTip(L"启动失败", L"核心初始化失败，程序将退出。");
             
-            // 发送退出消息关闭程序
             PostMessageW(hWnd, WM_COMMAND, ID_TRAY_EXIT, 0);
         }
     }
-    // --- 重构结束 ---
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
-// --- 重构结束 ---
-// --- 重构：修改 StopSingBox ---
 void StopSingBox() {
-    // 标记为正在退出，让监控线程自行终止
     g_isExiting = TRUE; 
 
-    // 1. 停止核心进程
     if (pi.hProcess) {
         DWORD exitCode = 0;
         GetExitCodeProcess(pi.hProcess, &exitCode);
@@ -933,42 +800,37 @@ void StopSingBox() {
         CloseHandle(pi.hThread);
     }
     
-    // 2. 终止并清理崩溃监控线程
     if (hMonitorThread) {
-        // 进程终止后，此线程会很快退出
         WaitForSingleObject(hMonitorThread, 1000);
         CloseHandle(hMonitorThread);
     }
 
-    // 3. 终止并清理日志监控线程
     if (hChildStd_OUT_Rd_Global) {
-        // 关闭管道的读取端，这将导致 LogMonitorThread 中的 ReadFile 失败
         CloseHandle(hChildStd_OUT_Rd_Global);
     }
     if (hLogMonitorThread) {
-        // 等待日志线程安全退出
         WaitForSingleObject(hLogMonitorThread, 1000);
         CloseHandle(hLogMonitorThread);
     }
 
-    // 4. 重置所有全局句柄
     ZeroMemory(&pi, sizeof(pi));
     hMonitorThread = NULL;
     hLogMonitorThread = NULL;
     hChildStd_OUT_Rd_Global = NULL;
     
-    // g_isExiting 会在 StartSingBox 或程序退出前被重置
 }
-// --- 重构结束 ---
 
 void SetAutorun(BOOL enable) {
     HKEY hKey;
     wchar_t path[MAX_PATH];
+    wchar_t pathWithArg[MAX_PATH + 20]; 
+
     GetModuleFileNameW(NULL, path, MAX_PATH);
     RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL);
     if (hKey) {
         if (enable) {
-            RegSetValueExW(hKey, L"singbox_tray", 0, REG_SZ, (BYTE*)path, (wcslen(path) + 1) * sizeof(wchar_t));
+            wsprintfW(pathWithArg, L"\"%s\" /autorun", path);
+            RegSetValueExW(hKey, L"singbox_tray", 0, REG_SZ, (BYTE*)pathWithArg, (wcslen(pathWithArg) + 1) * sizeof(wchar_t));
         } else {
             RegDeleteValueW(hKey, L"singbox_tray");
         }
@@ -978,45 +840,40 @@ void SetAutorun(BOOL enable) {
 
 BOOL IsAutorunEnabled() {
     HKEY hKey;
-    wchar_t path[MAX_PATH];
-    GetModuleFileNameW(NULL, path, MAX_PATH);
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(NULL, exePath, MAX_PATH); 
+
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        wchar_t value[MAX_PATH];
+        wchar_t value[MAX_PATH + 50]; 
         DWORD size = sizeof(value);
         LONG res = RegQueryValueExW(hKey, L"singbox_tray", NULL, NULL, (LPBYTE)value, &size);
         RegCloseKey(hKey);
-        return (res == ERROR_SUCCESS && wcscmp(value, path) == 0);
+
+        if (res == ERROR_SUCCESS) {
+            if (wcsstr(value, exePath) != NULL) {
+                return TRUE;
+            }
+        }
     }
     return FALSE;
 }
 
-// (--- 移除了 OpenConverterHtmlFromResource ---)
-
-// =========================================================================
-// (--- 修改 ---) 从网络下载配置文件
-// (修正): 切换到 curl.exe (需要 curl.exe 在同一目录)
-// (修正): 使用绝对路径启动 curl.exe，并设置工作目录
-// =========================================================================
 BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
-    wchar_t cmdLine[4096]; // (--- 缓冲区增大以容纳更长的URL ---)
+    wchar_t cmdLine[4096]; 
     wchar_t fullSavePath[MAX_PATH];
     wchar_t fullCurlPath[MAX_PATH];
     wchar_t moduleDir[MAX_PATH];
 
-    // 1. 获取程序 .exe 所在的目录
     GetModuleFileNameW(NULL, moduleDir, MAX_PATH);
     wchar_t* p = wcsrchr(moduleDir, L'\\');
     if (p) {
-        *p = L'\0'; // 截断文件名，只保留目录
+        *p = L'\0'; 
     } else {
-        // 无法获取目录，使用当前目录
         wcsncpy(moduleDir, L".", MAX_PATH);
     }
 
-    // 2. 构建 curl.exe 的绝对路径
     wsprintfW(fullCurlPath, L"%s\\curl.exe", moduleDir);
 
-    // 3. 检查 curl.exe 是否真的存在
     DWORD fileAttr = GetFileAttributesW(fullCurlPath);
     if (fileAttr == INVALID_FILE_ATTRIBUTES || (fileAttr & FILE_ATTRIBUTE_DIRECTORY)) {
          wchar_t errorMsg[MAX_PATH + 256];
@@ -1027,45 +884,36 @@ BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
         return FALSE;
     }
 
-    // 4. 获取 config.dat 的绝对路径
-    // (--- 修改：savePath 已经是完整路径，但 GetFullPathNameW 仍然有用 ---)
     if (GetFullPathNameW(savePath, MAX_PATH, fullSavePath, NULL) == 0) {
         ShowError(L"下载失败", L"无法验证配置文件的绝对路径。");
         return FALSE;
     }
 
-    // 5. 构造 curl.exe 命令
-    // -k 允许不安全的 SSL 连接 (跳过证书验证)
-    // -L 跟随重定向
-    // -sS 静默但显示错误
-    // -o 输出文件
     wsprintfW(cmdLine, 
-        L"\"%s\" -ksSL -o \"%s\" \"%s\"", // 注意：不再需要 cmd.exe /C
+        L"\"%s\" -ksSL -o \"%s\" \"%s\"", 
         fullCurlPath, fullSavePath, url
     );
 
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION downloaderPi = {0};
     si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE; // 隐藏 cmd 窗口
+    si.wShowWindow = SW_HIDE; 
 
-    // 6. 直接执行 curl.exe，并将工作目录设置为 .exe 所在目录
-    if (!CreateProcessW(NULL,           // lpApplicationName (use cmdLine)
-                        cmdLine,        // lpCommandLine (必须是可修改的)
-                        NULL,           // lpProcessAttributes
-                        NULL,           // lpThreadAttributes
-                        FALSE,          // bInheritHandles
-                        CREATE_NO_WINDOW, // dwCreationFlags
-                        NULL,           // lpEnvironment
-                        moduleDir,      // lpCurrentDirectory (在 .exe 所在目录运行)
-                        &si,            // lpStartupInfo
-                        &downloaderPi)) // lpProcessInformation
+    if (!CreateProcessW(NULL,           
+                        cmdLine,        
+                        NULL,           
+                        NULL,           
+                        FALSE,          
+                        CREATE_NO_WINDOW, 
+                        NULL,           
+                        moduleDir,      
+                        &si,            
+                        &downloaderPi)) 
     {
         ShowError(L"下载失败", L"无法启动 curl.exe 下载进程 (CreateProcessW)。");
         return FALSE;
     }
 
-    // 7. 等待下载进程完成 (最多30秒)
     DWORD waitResult = WaitForSingleObject(downloaderPi.hProcess, 30000); 
 
     if (waitResult == WAIT_TIMEOUT) {
@@ -1089,84 +937,64 @@ BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
         return FALSE;
     }
 
-    // 8. 检查文件是否真的被下载了
     long fileSize = 0;
     char* fileBuffer = NULL;
     if (ReadFileToBuffer(savePath, &fileBuffer, &fileSize)) {
-        if (fileSize < 50) { // 假设一个有效的 JSON 配置至少大于 50 字节
+        if (fileSize < 50) { 
              ShowError(L"下载失败", L"下载的文件过小 (小于 50 字节)。\n"
                                    L"这可能是一个错误页面，请检查 URL 是否为[原始]链接。");
              free(fileBuffer);
              return FALSE;
         }
         free(fileBuffer);
-        // 文件存在且大小不为0，视为成功
         return TRUE; 
     } else {
-        ShowError(L"下载失败", L"curl.exe 报告成功，但无法读取下载的临时配置文件。"); // (--- 修改: .json -> 临时配置文件 ---)
+        ShowError(L"下载失败", L"curl.exe 报告成功，但无法读取下载的临时配置文件。"); 
         return FALSE;
     }
 }
 
-// =========================================================================
-// (--- 移除了所有节点管理功能实现 ---)
-// =========================================================================
-
-
-// =========================================================================
-// (--- 新增 ---) 日志查看器功能实现
-// =========================================================================
-
-// 日志窗口过程函数
 LRESULT CALLBACK LogViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hEdit = NULL;
-    // 定义日志缓冲区的大小限制，防止窗口因日志过多而卡死
-    const int MAX_LOG_LENGTH = 200000;  // 最大字符数
-    const int TRIM_LOG_LENGTH = 100000; // 裁剪后保留的字符数
+    const int MAX_LOG_LENGTH = 200000;  
+    const int TRIM_LOG_LENGTH = 100000; 
 
     switch (msg) {
         case WM_CREATE: {
             hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                     WS_CHILD | WS_VISIBLE | WS_VSCROLL |
                                     ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
-                                    0, 0, 0, 0, // 将在 WM_SIZE 中调整大小
+                                    0, 0, 0, 0, 
                                     hWnd, (HMENU)ID_LOGVIEWER_EDIT,
                                     GetModuleHandle(NULL), NULL);
             
             if (hEdit == NULL) {
                 ShowError(L"创建失败", L"无法创建日志显示框。");
-                return -1; // 阻止窗口创建
+                return -1; 
             }
             
-            // 设置等宽字体
             SendMessage(hEdit, WM_SETFONT, (WPARAM)hLogFont, TRUE);
             break;
         }
 
         case WM_LOG_UPDATE: {
-            // 这是从 LogMonitorThread 线程接收到的消息
             wchar_t* pLogChunk = (wchar_t*)lParam;
             if (pLogChunk) {
-                // 性能优化：检查是否需要裁剪日志
                 int textLen = GetWindowTextLengthW(hEdit);
                 if (textLen > MAX_LOG_LENGTH) {
-                    // 裁剪：删除前 TRIM_LOG_LENGTH 个字符
                     SendMessageW(hEdit, EM_SETSEL, 0, TRIM_LOG_LENGTH);
                     SendMessageW(hEdit, EM_REPLACESEL, 0, (LPARAM)L"[... 日志已裁剪 ...]\r\n");
                 }
 
-                // 追加新文本
-                SendMessageW(hEdit, EM_SETSEL, (WPARAM)-1, (LPARAM)-1); // 移动到文本末尾
-                SendMessageW(hEdit, EM_REPLACESEL, 0, (LPARAM)pLogChunk); // 追加新日志
+                SendMessageW(hEdit, EM_SETSEL, (WPARAM)-1, (LPARAM)-1); 
+                SendMessageW(hEdit, EM_REPLACESEL, 0, (LPARAM)pLogChunk); 
                 
-                // 释放由 LogMonitorThread 分配的内存
                 free(pLogChunk);
             }
             break;
         }
 
         case WM_SIZE: {
-            // 窗口大小改变时，自动填满 EDIT 控件
             RECT rcClient;
             GetClientRect(hWnd, &rcClient);
             MoveWindow(hEdit, 0, 0, rcClient.right, rcClient.bottom, TRUE);
@@ -1174,16 +1002,12 @@ LRESULT CALLBACK LogViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
         }
 
         case WM_CLOSE: {
-            // 用户点击关闭时，只隐藏窗口，不销毁
-            // 这样下次打开时，日志历史还在
             ShowWindow(hWnd, SW_HIDE);
-            // (--- 修正：标记为 NULL，以便 OpenLogViewerWindow 知道需要重新创建 ---)
-            hLogViewerWnd = NULL; // 标记为“已关闭”
+            hLogViewerWnd = NULL; 
             break;
         }
 
         case WM_DESTROY: {
-            // 窗口被真正销毁时（例如程序退出时）
             hLogViewerWnd = NULL;
             break;
         }
@@ -1194,16 +1018,13 @@ LRESULT CALLBACK LogViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
     return 0;
 }
 
-// 打开或显示日志窗口
 void OpenLogViewerWindow() {
     if (hLogViewerWnd != NULL) {
-        // 窗口已存在，只需显示并置顶
         ShowWindow(hLogViewerWnd, SW_SHOW);
         SetForegroundWindow(hLogViewerWnd);
         return;
     }
 
-    // 窗口不存在，需要创建
     const wchar_t* LOGVIEWER_CLASS_NAME = L"SingboxLogViewerClass";
     WNDCLASSW wc = {0};
     wc.lpfnWndProc = LogViewerWndProc;
@@ -1211,9 +1032,9 @@ void OpenLogViewerWindow() {
     wc.lpszClassName = LOGVIEWER_CLASS_NAME;
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hIcon = LoadIconW(GetModuleHandle(NULL), MAKEINTRESOURCE(1)); // 使用主程序图标
+    wc.hIcon = LoadIconW(GetModuleHandle(NULL), MAKEINTRESOURCE(1)); 
     if (wc.hIcon == NULL) {
-        wc.hIcon = LoadIconW(NULL, IDI_APPLICATION); // 备用图标
+        wc.hIcon = LoadIconW(NULL, IDI_APPLICATION); 
     }
 
     if (!GetClassInfoW(wc.hInstance, LOGVIEWER_CLASS_NAME, &wc)) {
@@ -1223,17 +1044,15 @@ void OpenLogViewerWindow() {
         }
     }
 
-    // (--- 修正：hLogViewerWnd 在 WM_CREATE 之前赋值 ---)
     hLogViewerWnd = CreateWindowExW(
         0, LOGVIEWER_CLASS_NAME, L"Sing-box 实时日志",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE, 
         CW_USEDEFAULT, CW_USEDEFAULT, 700, 450,
-        hwnd, // 父窗口设为主窗口，以便管理
+        hwnd, 
         NULL, wc.hInstance, NULL
     );
 
     if (hLogViewerWnd) {
-        // 尝试将窗口居中
         RECT rc, rcOwner;
         GetWindowRect(hLogViewerWnd, &rc);
         GetWindowRect(GetDesktopWindow(), &rcOwner);
@@ -1246,23 +1065,20 @@ void OpenLogViewerWindow() {
     }
 }
 
-
-// =========================================================================
-// (--- 新增：异步初始化工作线程 ---)
-// =========================================================================
 DWORD WINAPI InitThread(LPVOID lpParam) {
-    HWND hWndMain = (HWND)lpParam;
+    INIT_THREAD_PARAMS* pParams = (INIT_THREAD_PARAMS*)lpParam;
+    HWND hWndMain = pParams->hWndMain;
+    BOOL isAutorun = pParams->isAutorun;
     
-    // (--- 启动逻辑从 wWinMain 迁移至此 ---)
+    free(pParams); 
+    pParams = NULL; 
     
-    // (--- 宏替换：在线程上下文中，失败时发送消息并退出线程 ---)
     #define THREAD_CLEANUP_AND_EXIT(success) \
         do { \
             PostMessageW(hWndMain, WM_INIT_COMPLETE, (WPARAM)(success), (LPARAM)0); \
             return (success) ? 0 : 1; \
         } while (0)
 
-    // (--- 新增：获取临时目录并设置配置文件路径 ---)
     wchar_t tempPathBuffer[MAX_PATH];
     DWORD tempPathLen = GetTempPathW(MAX_PATH, tempPathBuffer);
     if (tempPathLen == 0 || tempPathLen > MAX_PATH) {
@@ -1271,83 +1087,82 @@ DWORD WINAPI InitThread(LPVOID lpParam) {
     }
     wsprintfW(g_configFilePath, L"%sconfig.dat", tempPathBuffer);
     wsprintfW(g_tempConfigFilePath, L"%sconfig.dat.tmp", tempPathBuffer);
-    // --- (新增结束) ---
+    
+    int retryCount = 0;
+    const int maxRetries = 5; 
+    const int retryDelay = 15000; 
 
-    // =========================================================================
-    // (--- 流程图逻辑开始 (严格模式) ---)
-    // =========================================================================
+    BOOL downloadSuccess = DownloadConfig(g_configUrl, g_tempConfigFilePath);
+
+    if (!downloadSuccess && isAutorun) {
+        PostMessageW(hWndMain, WM_INIT_LOG, 0, (LPARAM)_wcsdup(L"[InitThread] 首次下载失败 (开机启动)，15秒后重试...\r\n"));
+
+        while (retryCount < maxRetries) {
+            Sleep(retryDelay); 
+            retryCount++;
+            
+            wchar_t retryMsg[100];
+            wsprintfW(retryMsg, L"[InitThread] 正在进行第 %d/%d 次重试...\r\n", retryCount, maxRetries);
+            PostMessageW(hWndMain, WM_INIT_LOG, 0, (LPARAM)_wcsdup(retryMsg));
+
+            downloadSuccess = DownloadConfig(g_configUrl, g_tempConfigFilePath);
+            if (downloadSuccess) {
+                PostMessageW(hWndMain, WM_INIT_LOG, 0, (LPARAM)_wcsdup(L"[InitThread] 重试下载成功。\r\n"));
+                break; 
+            } else {
+                wchar_t failMsg[100];
+                wsprintfW(failMsg, L"[InitThread] 第 %d/%d 次重试失败。\r\n", retryCount, maxRetries);
+                PostMessageW(hWndMain, WM_INIT_LOG, 0, (LPARAM)_wcsdup(failMsg));
+            }
+        }
+    }
     
-    // 1. 检查配置地址是否有效 (通过下载到 .tmp 实现)
-    // (--- ShowTrayTip 必须在主线程中调用，已移至主线程 ---)
-    
-    if (!DownloadConfig(g_configUrl, g_tempConfigFilePath)) {
-        // 2. 无效 -> 退出
-        // 错误消息已在 DownloadConfig 内部显示
+    if (!downloadSuccess) {
         THREAD_CLEANUP_AND_EXIT(FALSE);
     }
 
-    // 3. 有效 -> 检查 config.dat 是否存在
     DWORD fileAttr = GetFileAttributesW(g_configFilePath);
     BOOL configExists = (fileAttr != INVALID_FILE_ATTRIBUTES && !(fileAttr & FILE_ATTRIBUTE_DIRECTORY));
 
     if (configExists) {
-        // --- 路径: 存在 ---
-        // (--- ShowTrayTip 必须在主线程中调用 ---)
-
-        // 1. 启动核心 (使用旧的 config.dat)
-        if (!ParseTags()) { // ParseTags 默认读取 g_configFilePath
+        if (!ParseTags()) { 
             wchar_t errorMsg[MAX_PATH + 256];
             wsprintfW(errorMsg, L"无法读取或解析本地 config.dat 文件。\n\n请删除 %s 后重试。", g_configFilePath);
             MessageBoxW(NULL, errorMsg, L"本地配置解析失败", MB_OK | MB_ICONERROR); 
-            DeleteFileW(g_tempConfigFilePath); // 清理下载的临时文件
+            DeleteFileW(g_tempConfigFilePath); 
             THREAD_CLEANUP_AND_EXIT(FALSE);
         }
         
         g_isExiting = FALSE;
         StartSingBox();
 
-        // 2. 下载配置文件 (已在第1步完成, 存为 g_tempConfigFilePath)
-
-        // 3. 比较 两次 config.dat 大小
         long oldSize = 0;
         char* oldBuf = NULL;
-        ReadFileToBuffer(g_configFilePath, &oldBuf, &oldSize); // 读取旧文件大小
+        ReadFileToBuffer(g_configFilePath, &oldBuf, &oldSize); 
         if (oldBuf) free(oldBuf);
             
         long newSize = 0;
         char* newBuf = NULL;
-        ReadFileToBuffer(g_tempConfigFilePath, &newBuf, &newSize); // 读取新文件大小
+        ReadFileToBuffer(g_tempConfigFilePath, &newBuf, &newSize); 
         if (newBuf) free(newBuf);
 
-        // 4. 检查大小
         if (newSize > 0 && abs(newSize - oldSize) > 100) {
-            // 5. 相差大于100字节 -> 覆盖
             if (MoveFileExW(g_tempConfigFilePath, g_configFilePath, MOVEFILE_REPLACE_EXISTING)) {
-                // (--- 覆盖成功，通知主线程 ---)
-                // (--- 注意：ShowTrayTip 不能在此调用，主线程将显示 "启动成功" ---)
-                // (--- 我们可以在主线程的 WM_INIT_COMPLETE 处理器中添加一个 "配置已更新" 的提示 ---)
             } else {
-                // (--- 覆盖失败，继续使用旧配置 ---)
                 DeleteFileW(g_tempConfigFilePath);
             }
         } else {
-            // 6. 相差小于100字节 -> 保留
             DeleteFileW(g_tempConfigFilePath);
         }
 
     } else {
-        // --- 路径: 不存在 ---
-        // (--- ShowTrayTip 必须在主线程中调用 ---)
-
-        // 1. 下载配置文件 (已在第1步完成, 存为 g_tempConfigFilePath, 现在移动它)
         if (!MoveFileExW(g_tempConfigFilePath, g_configFilePath, MOVEFILE_REPLACE_EXISTING)) {
              ShowError(L"启动失败", L"无法将下载的配置 (tmp) 重命名为 config.dat。");
              DeleteFileW(g_tempConfigFilePath);
              THREAD_CLEANUP_AND_EXIT(FALSE);
         }
         
-        // 2. 启动核心
-        if (!ParseTags()) { // ParseTags 默认读取 g_configFilePath
+        if (!ParseTags()) { 
             MessageBoxW(NULL, L"无法读取或解析下载的 config.dat 文件。\n\n该文件是否为有效的JSON格式？", L"配置解析失败", MB_OK | MB_ICONERROR);
             THREAD_CLEANUP_AND_EXIT(FALSE);
         }
@@ -1355,23 +1170,13 @@ DWORD WINAPI InitThread(LPVOID lpParam) {
         g_isExiting = FALSE;
         StartSingBox();
     }
-
-    // =========================================================================
-    // (--- 流程图逻辑结束 ---)
-    // =========================================================================
     
     #undef THREAD_CLEANUP_AND_EXIT
     
-    // --- 成功：通知主线程 ---
     PostMessageW(hWndMain, WM_INIT_COMPLETE, (WPARAM)TRUE, (LPARAM)0);
     return 0;
 }
 
-
-// =========================================================================
-// 主函数 (--- 已按流程图修改 ---)
-// (--- 已重构：异步启动 ---)
-// =========================================================================
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int nCmdShow) {
     wchar_t mutexName[128];
@@ -1379,12 +1184,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
 
     g_hFont = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"宋体");
 
-    // --- 新增：创建日志等宽字体 ---
     hLogFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
     if (hLogFont == NULL) {
-        hLogFont = (HFONT)GetStockObject(SYSTEM_FIXED_FONT); // 备用字体
+        hLogFont = (HFONT)GetStockObject(SYSTEM_FIXED_FONT); 
     }
-    // --- 新增结束 ---
 
     wsprintfW(guidString, L"{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
         APP_GUID.Data1, APP_GUID.Data2, APP_GUID.Data3,
@@ -1398,7 +1201,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
         MessageBoxW(NULL, L"程序已在运行。", L"提示", MB_OK | MB_ICONINFORMATION);
         if (hMutex) CloseHandle(hMutex);
         if (g_hFont) DeleteObject(g_hFont);
-        if (hLogFont) DeleteObject(hLogFont); // 退出前清理
+        if (hLogFont) DeleteObject(hLogFont); 
         return 0;
     }
 
@@ -1411,7 +1214,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     wchar_t* p = wcsrchr(szPath, L'\\');
     if (p) {
         *p = L'\0';
-        SetCurrentDirectoryW(szPath); // 仍然设置当前目录，用于 set.ini
+        SetCurrentDirectoryW(szPath); 
         wcsncpy(g_iniFilePath, szPath, MAX_PATH - 1);
         g_iniFilePath[MAX_PATH - 1] = L'\0';
         wcsncat(g_iniFilePath, L"\\set.ini", MAX_PATH - wcslen(g_iniFilePath) - 1);
@@ -1419,7 +1222,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
         wcsncpy(g_iniFilePath, L"set.ini", MAX_PATH - 1);
     }
     
-    // (--- 退出程序的清理宏 ---)
     #define CLEANUP_AND_EXIT() \
         do { \
             if (hMutex) CloseHandle(hMutex); \
@@ -1430,14 +1232,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
             return 1; \
         } while (0)
 
-    // (--- 移除：路径设置已移至 InitThread ---)
-
-    // --- (修改) 启动逻辑 ---
     
-    // (--- 新增：提前加载设置 ---)
     LoadSettings();
 
-    // 1. 创建窗口和托盘图标
     const wchar_t* CLASS_NAME = L"TrayWindowClass";
     WNDCLASSW wc = {0};
     wc.lpfnWndProc = WndProc;
@@ -1445,18 +1242,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     wc.lpszClassName = CLASS_NAME;
     wc.hIcon = LoadIconW(hInstance, MAKEINTRESOURCE(1));
     if (!wc.hIcon) {
-        // (移除了图标加载失败的提示)
         wc.hIcon = LoadIconW(NULL, IDI_APPLICATION);
     }
     RegisterClassW(&wc);
     hwnd = CreateWindowExW(0, CLASS_NAME, L"TrayApp", 0, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
     if (!hwnd) {
         if (g_hFont) DeleteObject(g_hFont);
-        if (hLogFont) DeleteObject(hLogFont); // 退出前清理
+        if (hLogFont) DeleteObject(hLogFont); 
         return 1;
     }
 
-    // (--- 移动到 LoadSettings() 之后 ---)
     if (g_hotkeyVk != 0 || g_hotkeyModifiers != 0) {
         if (!RegisterHotKey(hwnd, ID_GLOBAL_HOTKEY, g_hotkeyModifiers, g_hotkeyVk)) {
             MessageBoxW(NULL, L"注册全局快捷键失败！\n可能已被其他程序占用。", L"快捷键错误", MB_OK | MB_ICONWARNING);
@@ -1472,50 +1267,47 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     wcsncpy(nid.szTip, L"程序正在启动...", ARRAYSIZE(nid.szTip) - 1);
     nid.szTip[ARRAYSIZE(nid.szTip) - 1] = L'\0';
 
-    // (--- 移动到 LoadSettings() 之后 ---)
     if (g_isIconVisible) {
         Shell_NotifyIconW(NIM_ADD, &nid);
     }
 
-    // =========================================================================
-    // (--- 流程图逻辑已移至 InitThread ---)
-    // =========================================================================
-
-    // (--- 新增：启动初始化工作线程 ---)
-    HANDLE hInitThread = CreateThread(NULL, 0, InitThread, (LPVOID)hwnd, 0, NULL);
-    if (hInitThread) {
-        // 立即关闭句柄，让线程在完成后自行销毁
-        CloseHandle(hInitThread); 
-    } else {
-        ShowError(L"致命错误", L"无法创建启动线程。");
+    
+    INIT_THREAD_PARAMS* pInitParams = (INIT_THREAD_PARAMS*)malloc(sizeof(INIT_THREAD_PARAMS));
+    if (pInitParams == NULL) {
+        ShowError(L"致命错误", L"无法分配启动参数内存。");
         if (g_isIconVisible) Shell_NotifyIconW(NIM_DELETE, &nid);
         CLEANUP_AND_EXIT();
     }
     
-    // (--- 移除清理宏定义 ---)
+    pInitParams->hWndMain = hwnd;
+    pInitParams->isAutorun = (wcsstr(lpCmdLine, L"/autorun") != NULL);
+
+    HANDLE hInitThread = CreateThread(NULL, 0, InitThread, (LPVOID)pInitParams, 0, NULL);
+    if (hInitThread) {
+        CloseHandle(hInitThread); 
+    } else {
+        ShowError(L"致命错误", L"无法创建启动线程。");
+        if (g_isIconVisible) Shell_NotifyIconW(NIM_DELETE, &nid);
+        free(pInitParams); 
+        CLEANUP_AND_EXIT();
+    }
+    
     #undef CLEANUP_AND_EXIT
 
-    // =========================================================================
-    // (--- 立即进入消息循环，程序保持响应 ---)
-    // =========================================================================
-
+    
     wcsncpy(nid.szTip, L"程序正在启动... (下载配置)", ARRAYSIZE(nid.szTip) - 1);
     if(g_isIconVisible) { Shell_NotifyIconW(NIM_MODIFY, &nid); }
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
-        // --- 新增：检查是否是日志窗口的消息 ---
-        // IsDialogMessage 允许在日志窗口的 EDIT 控件中使用 TAB 键
         if (hLogViewerWnd == NULL || !IsDialogMessageW(hLogViewerWnd, &msg)) {
              TranslateMessage(&msg);
              DispatchMessage(&msg);
         }
-        // --- 新增结束 ---
     }
     
-    // 程序退出前最后一次清理
     if (!g_isExiting) {
-         g_isExiting = TRUE; // 确保在 GetMessage 循环外退出时也标记
+         g_isExiting = TRUE; 
          StopSingBox(); 
     }
     
@@ -1526,9 +1318,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     if (hMutex) CloseHandle(hMutex);
     UnregisterClassW(CLASS_NAME, hInstance);
     
-    // --- 新增：清理字体 ---
     if (hLogFont) DeleteObject(hLogFont);
-    // --- 新增结束 ---
     
     if (g_hFont) DeleteObject(g_hFont);
     return (int)msg.wParam;
