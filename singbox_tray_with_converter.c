@@ -82,6 +82,7 @@ UINT g_hotkeyModifiers = 0;
 UINT g_hotkeyVk = 0;
 wchar_t g_iniFilePath[MAX_PATH] = {0};
 wchar_t g_configUrl[2048] = {0}; // (--- 新增：用于存储配置URL ---)
+wchar_t g_configPath[MAX_PATH] = {0}; // (--- 新增：存储 base.bat 的完整路径 ---)
 
 
 // --- 重构：新增守护功能全局变量 ---
@@ -123,8 +124,8 @@ BOOL IsAutorunEnabled();
 // void OpenConverterHtmlFromResource(); // (--- 已移除 ---)
 // char* ConvertLfToCrlf(const char* input); // (--- 已移除 ---)
 // void CreateDefaultConfig(); // (--- 已移除 ---)
-BOOL WriteBufferToFileW(const wchar_t* filename, const char* buffer, long fileSize); // (--- 新增 ---)
-BOOL MoveFileCrossVolumeW(const wchar_t* lpExistingFileName, const wchar_t* lpNewFileName); // (--- 新增 ---)
+// BOOL WriteBufferToFileW(const wchar_t* filename, const char* buffer, long fileSize); // (--- 已移除 ---)
+// BOOL MoveFileCrossVolumeW(const wchar_t* lpExistingFileName, const wchar_t* lpNewFileName); // (--- 已移除 ---)
 BOOL DownloadConfig(HWND hWndMain, const wchar_t* url, const wchar_t* savePath); // (--- 修改：增加 hWndMain 参数 ---)
 void PostTrayTip(HWND hWndMain, const wchar_t* title, const wchar_t* message); // (--- 新增：后台发消息函数 ---)
 
@@ -343,7 +344,7 @@ void OpenSettingsWindow() {
 }
 
 // =========================================================================
-// (已修改) 解析 config.json 以获取节点列表和当前节点 (读取 route.final)
+// (已修改) 解析 config.json (现在是 g_configPath)
 // =========================================================================
 BOOL ParseTags() {
     CleanupDynamicNodes();
@@ -351,7 +352,8 @@ BOOL ParseTags() {
     httpPort = 0;
     char* buffer = NULL;
     long size = 0;
-    if (!ReadFileToBuffer(L"config.json", &buffer, &size)) {
+    // (--- 已修改：读取临时目录中的配置文件 ---)
+    if (!ReadFileToBuffer(g_configPath, &buffer, &size)) {
         return FALSE;
     }
     cJSON* root = cJSON_Parse(buffer);
@@ -520,7 +522,7 @@ DWORD WINAPI LogMonitorThread(LPVOID lpParam) {
 // --- 重构结束 ---
 
 
-// --- 重构：修改 StartSingBox ---
+// --- 重构：修改 StartSingBox (使用 g_configPath) ---
 void StartSingBox() {
     HANDLE hPipe_Rd_Local = NULL; // 管道读取端（本地）
     HANDLE hPipe_Wr_Local = NULL; // 管道写入端（本地）
@@ -552,9 +554,9 @@ void StartSingBox() {
     si.hStdOutput = hPipe_Wr_Local;
     si.hStdError = hPipe_Wr_Local;
 
-    wchar_t cmdLine[MAX_PATH];
-    wcsncpy(cmdLine, L"sing-box.exe run -c config.json", ARRAYSIZE(cmdLine));
-    cmdLine[ARRAYSIZE(cmdLine) - 1] = L'\0';
+    // (--- 已修改：使用 g_configPath 启动 ---)
+    wchar_t cmdLine[MAX_PATH + 64]; // 增加缓冲区
+    wsprintfW(cmdLine, L"sing-box.exe run -c \"%s\"", g_configPath);
 
     if (!CreateProcessW(NULL, cmdLine, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         ShowError(L"核心程序启动失败", L"无法创建 sing-box.exe 进程。");
@@ -581,7 +583,7 @@ void StartSingBox() {
         }
 
         wchar_t fullMessage[8192];
-        wsprintfW(fullMessage, L"sing-box.exe 核心程序启动后立即退出。\n\n可能的原因:\n- 配置文件(config.json)格式错误\n- 核心文件损坏或不兼容\n\n核心程序输出:\n%s", errorOutput);
+        wsprintfW(fullMessage, L"sing-box.exe 核心程序启动后立即退出。\n\n可能的原因:\n- 配置文件(base.bat)格式错误\n- 核心文件损坏或不兼容\n\n核心程序输出:\n%s", errorOutput);
         ShowError(L"核心程序启动失败", fullMessage);
         
         CloseHandle(pi.hProcess);
@@ -718,13 +720,14 @@ BOOL IsSystemProxyEnabled() {
 }
 
 // =========================================================================
-// (已修改) 安全地修改 config.json 中的路由 (修改 route.final)
+// (已修改) 安全地修改 g_configPath (base.bat)
 // =========================================================================
 void SafeReplaceOutbound(const wchar_t* newTag) {
     char* buffer = NULL;
     long size = 0;
-    if (!ReadFileToBuffer(L"config.json", &buffer, &size)) {
-        MessageBoxW(NULL, L"无法打开 config.json", L"错误", MB_OK | MB_ICONERROR);
+    // (--- 已修改：读取临时目录中的配置文件 ---)
+    if (!ReadFileToBuffer(g_configPath, &buffer, &size)) {
+        MessageBoxW(NULL, L"无法打开配置文件", L"错误", MB_OK | MB_ICONERROR);
         return;
     }
     int mbLen = WideCharToMultiByte(CP_UTF8, 0, newTag, -1, NULL, 0, NULL, NULL);
@@ -760,7 +763,8 @@ void SafeReplaceOutbound(const wchar_t* newTag) {
 
     if (newContent) {
         FILE* out = NULL;
-        if (_wfopen_s(&out, L"config.json", L"wb") == 0 && out != NULL) {
+        // (--- 已修改：写入临时目录中的配置文件 ---)
+        if (_wfopen_s(&out, g_configPath, L"wb") == 0 && out != NULL) {
             fwrite(newContent, 1, strlen(newContent), out);
             fclose(out);
         }
@@ -838,6 +842,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (IsSystemProxyEnabled()) SetSystemProxy(FALSE);
             StopSingBox();
             CleanupDynamicNodes();
+
+            // (--- 新增：退出时删除临时配置文件 ---)
+            if (g_configPath[0] != L'\0') {
+                DeleteFileW(g_configPath);
+            }
+
             PostQuitMessage(0);
         } else if (id == ID_TRAY_AUTORUN) {
             SetAutorun(!IsAutorunEnabled());
@@ -1001,58 +1011,12 @@ BOOL IsAutorunEnabled() {
 // =========================================================================
 
 // =========================================================================
-// (--- 新增：辅助函数，将内存缓冲区写入文件 ---)
+// (--- WriteBufferToFileW 函数已移除 ---)
 // =========================================================================
-BOOL WriteBufferToFileW(const wchar_t* filename, const char* buffer, long fileSize) {
-    if (!buffer || fileSize <= 0) {
-        return FALSE;
-    }
-    FILE* f = NULL;
-    if (_wfopen_s(&f, filename, L"wb") != 0 || !f) {
-        return FALSE;
-    }
-    size_t written = fwrite(buffer, 1, fileSize, f);
-    fclose(f);
-    return (written == fileSize);
-}
 
 // =========================================================================
-// (--- 新增：实现跨磁盘驱动器的文件移动 ---)
+// (--- MoveFileCrossVolumeW 函数已移除 ---)
 // =========================================================================
-BOOL MoveFileCrossVolumeW(const wchar_t* lpExistingFileName, const wchar_t* lpNewFileName) {
-    // 1. 优先尝试快速移动 (同盘符)
-    if (MoveFileExW(lpExistingFileName, lpNewFileName, MOVEFILE_REPLACE_EXISTING)) {
-        return TRUE;
-    }
-
-    // 2. 检查是否为 "跨盘符" 错误
-    if (GetLastError() == ERROR_NOT_SAME_DEVICE) {
-        // 3. 备用方案：复制 和 删除
-        char* buffer = NULL;
-        long size = 0;
-
-        // 3a. 读取源文件 (临时文件)
-        if (!ReadFileToBuffer(lpExistingFileName, &buffer, &size) || size == 0) {
-            if (buffer) free(buffer);
-            return FALSE; // 无法读取源文件
-        }
-
-        // 3b. 写入目标文件 (config.json)
-        BOOL writeSuccess = WriteBufferToFileW(lpNewFileName, buffer, size);
-        free(buffer);
-
-        if (!writeSuccess) {
-            return FALSE; // 无法写入目标文件
-        }
-
-        // 3c. 删除源文件 (临时文件)
-        DeleteFileW(lpExistingFileName);
-        return TRUE; // 跨卷移动成功
-    }
-
-    // 4. 其他未知错误
-    return FALSE;
-}
 
 // =========================================================================
 // (--- 新增：辅助函数，用于后台线程安全地发送气泡提示 ---)
@@ -1121,7 +1085,7 @@ BOOL DownloadConfig(HWND hWndMain, const wchar_t* url, const wchar_t* savePath) 
     }
 
     // 4. 获取 savePath 的绝对路径
-    // (--- 优化：savePath 现在可能是临时路径，GetFullPathName 仍然适用 ---)
+    // (--- 优化：savePath 现在是临时路径，GetFullPathName 仍然适用 ---)
     if (GetFullPathNameW(savePath, MAX_PATH, fullSavePath, NULL) == 0) {
         ShowError(L"下载失败", L"无法获取配置文件的绝对路径。");
         return FALSE;
@@ -1188,7 +1152,7 @@ BOOL DownloadConfig(HWND hWndMain, const wchar_t* url, const wchar_t* savePath) 
     // 8. 检查文件是否真的被下载了
     long fileSize = 0;
     char* fileBuffer = NULL;
-    // (--- 优化：savePath 现在可能是临时路径，ReadFileToBuffer 仍然适用 ---)
+    // (--- 优化：savePath 现在是临时路径，ReadFileToBuffer 仍然适用 ---)
     if (ReadFileToBuffer(savePath, &fileBuffer, &fileSize)) {
         if (fileSize < 50) { // 假设一个有效的 JSON 配置至少大于 50 字节
              // (--- 修改：ShowError -> PostTrayTip ---)
@@ -1352,47 +1316,38 @@ void OpenLogViewerWindow() {
 DWORD WINAPI InitThread(LPVOID lpParam) {
     HWND hWndMain = (HWND)lpParam;
     
-    const wchar_t* configPath = L"config.json";
-    wchar_t tempConfigPath[MAX_PATH] = {0};
+    // (--- 移除了 configPath 和 tempConfigPath ---)
     BOOL isRemoteMode = (wcslen(g_configUrl) > 0);
 
     // (--- 宏替换：在线程上下文中，失败时发送消息并退出线程 ---)
     #define THREAD_CLEANUP_AND_EXIT(success) \
         do { \
-            if (tempConfigPath[0] != L'\0') DeleteFileW(tempConfigPath); \
             PostMessageW(hWndMain, WM_INIT_COMPLETE, (WPARAM)(success), (LPARAM)0); \
             return (success) ? 0 : 1; \
         } while (0)
 
+    // (--- 新逻辑：获取临时目录并设置 g_configPath ---)
+    wchar_t tempDir[MAX_PATH];
+    DWORD tempPathLen = GetTempPathW(MAX_PATH, tempDir);
+    if (tempPathLen == 0 || tempPathLen > MAX_PATH) {
+        ShowError(L"启动失败", L"无法获取系统临时目录路径。");
+        THREAD_CLEANUP_AND_EXIT(FALSE);
+    }
+    // 构造 "C:\Users\...\Temp\base.bat"
+    wsprintfW(g_configPath, L"%sbase.bat", tempDir);
+    // (--- 结束新逻辑 ---)
+
     if (isRemoteMode) {
         // --- 模式2：远程配置 (URL 已设置) ---
         
-        wchar_t tempDir[MAX_PATH];
-        DWORD tempPathLen = GetTempPathW(MAX_PATH, tempDir);
-        if (tempPathLen == 0 || tempPathLen > MAX_PATH) {
-            ShowError(L"启动失败", L"无法获取系统临时目录路径。");
-            THREAD_CLEANUP_AND_EXIT(FALSE);
-        }
-        if (GetTempFileNameW(tempDir, L"sbx", 0, tempConfigPath) == 0) {
-            ShowError(L"启动失败", L"无法在临时目录中创建临时文件。");
-            tempConfigPath[0] = L'\0';
-            THREAD_CLEANUP_AND_EXIT(FALSE);
-        }
-                
-        // (--- 已修改：传入 hWndMain 参数 ---)
-        if (!DownloadConfig(hWndMain, g_configUrl, tempConfigPath)) {
-            // (--- 已修改：下载失败，拒绝启动 ---)
+        // (--- 已修改：下载到 g_configPath (C:\...\Temp\base.bat) ---)
+        if (!DownloadConfig(hWndMain, g_configUrl, g_configPath)) {
+            // (--- 下载失败，拒绝启动 ---)
             ShowError(L"下载失败", L"无法从指定的 URL 下载配置文件。\n请检查网络连接或 ConfigUrl 设置。\n程序将退出。");
             THREAD_CLEANUP_AND_EXIT(FALSE);
         } 
         else {
-             // (--- 已修改：下载成功，始终覆盖 ---)
-             if (!MoveFileCrossVolumeW(tempConfigPath, configPath)) {
-                 ShowError(L"配置应用失败", L"无法将下载的配置 (tmp) 覆盖到 config.json。\n请检查文件权限。\n程序将退出。");
-                 DeleteFileW(tempConfigPath);
-                 THREAD_CLEANUP_AND_EXIT(FALSE);
-             }
-             tempConfigPath[0] = L'\0'; // 成功后清空
+             // (--- 下载成功，文件已在 g_configPath，无需移动 ---)
         }
     } else {
         // --- 模式1：本地配置 (URL 未设置) ---
@@ -1404,7 +1359,7 @@ DWORD WINAPI InitThread(LPVOID lpParam) {
     // --- (公共逻辑：解析) ---
     // 只有在下载成功后才会执行到这里
     if (!ParseTags()) {
-        MessageBoxW(NULL, L"无法读取或解析 config.json 文件。\n(可能下载的配置文件格式错误)\n程序将退出。", L"JSON 解析失败", MB_OK | MB_ICONERROR);
+        MessageBoxW(NULL, L"无法读取或解析配置文件。\n(可能下载的配置文件格式错误)\n程序将退出。", L"JSON 解析失败", MB_OK | MB_ICONERROR);
         THREAD_CLEANUP_AND_EXIT(FALSE);
     }
 
