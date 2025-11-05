@@ -122,7 +122,7 @@ void SetAutorun(BOOL enable);
 BOOL IsAutorunEnabled();
 // void OpenConverterHtmlFromResource(); // (--- 已移除 ---)
 // char* ConvertLfToCrlf(const char* input); // (--- 已移除 ---)
-void CreateDefaultConfig();
+// void CreateDefaultConfig(); // (--- 已移除 ---)
 BOOL WriteBufferToFileW(const wchar_t* filename, const char* buffer, long fileSize); // (--- 新增 ---)
 BOOL MoveFileCrossVolumeW(const wchar_t* lpExistingFileName, const wchar_t* lpNewFileName); // (--- 新增 ---)
 BOOL DownloadConfig(HWND hWndMain, const wchar_t* url, const wchar_t* savePath); // (--- 修改：增加 hWndMain 参数 ---)
@@ -897,8 +897,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ShowTrayTip(L"启动成功", L"程序已准备就绪。");
 
         } else {
+            // (--- 已修改 ---)
             // 启动失败，InitThread 已经显示了错误 MessageBox
-            ShowTrayTip(L"启动失败", L"核心初始化失败，程序将退出。");
+            // ShowTrayTip(L"启动失败", L"核心初始化失败，程序将退出。"); // (不再需要，ShowError已提示)
             
             // 发送退出消息关闭程序
             PostMessageW(hWnd, WM_COMMAND, ID_TRAY_EXIT, 0);
@@ -996,131 +997,8 @@ BOOL IsAutorunEnabled() {
 // (--- OpenConverterHtmlFromResource 函数已移除 ---)
 
 // =========================================================================
-// (已修改) 生成默认配置文件 (匹配 route.final 逻辑)
-// (--- 已修改：使用用户提供的 config.json 作为模板 ---)
+// (--- CreateDefaultConfig 函数已移除 ---)
 // =========================================================================
-void CreateDefaultConfig() {
-    // (--- 已修改 ---)
-    // 使用用户提供的 config.json 内容作为默认配置
-    const char* defaultConfig =
-        "{\n"
-        "\t\"log\": {\n"
-        "\t\t\"disabled\": false,\n"
-        "\t\t\"level\": \"debug\"\n"
-        "\t},\n"
-        "\t\"dns\": {\n"
-        "\t\t\"servers\": [\n"
-        "\t\t\t{\n"
-        "\t\t\t\t\"tag\": \"dns_resolver-tx\",\n"
-        "\t\t\t\t\"address\": \"119.29.29.29\",\n"
-        "\t\t\t\t\"detour\": \"🎯 全球直连\"\n"
-        "\t\t\t},\n"
-        "\t\t\t{\n"
-        "\t\t\t\t\"tag\": \"dns-direct-tx\",\n"
-        "\t\t\t\t\"address\": \"https://doh.pub/dns-query\",\n"
-        "\t\t\t\t\"address_resolver\": \"dns_resolver-tx\",\n"
-        "\t\t\t\t\"detour\": \"🎯 全球直连\"\n"
-        "\t\t\t},\n"
-        "\t\t\t{\n"
-        "\t\t\t\t\"tag\": \"dns-proxy-cf\",\n"
-        "\t\t\t\t\"address\": \"https://cloudflare-dns.com/dns-query\",\n"
-        "\t\t\t\t\"address_resolver\": \"dns_resolver-tx\",\n"
-        "\t\t\t\t\"detour\": \"🎈 自动选择\"\n"
-        "\t\t\t},\n"
-        "\t\t\t{\n"
-        "\t\t\t\t\"tag\": \"dns-block\",\n"
-        "\t\t\t\t\"address\": \"rcode://refused\"\n"
-        "\t\t\t}\n"
-        "\t\t],\n"
-        "\t\t\"rules\": [\n"
-        "\t\t\t{\n"
-        "\t\t\t\t\"domain_suffix\": [\n"
-        "\t\t\t\t\t\"visa.com.tw\",\n"
-        "\t\t\t\t\t\"visa.com.sg\",\n"
-        "\t\t\t\t\t\"visa.com\",\n"
-        "\t\t\t\t\t\"abrdns.com\"\n"
-        "\t\t\t\t],\n"
-        "\t\t\t\t\"server\": \"dns-direct-tx\"\n"
-        "\t\t\t}\n"
-        "\t\t],\n"
-        "\t\t\"strategy\": \"ipv4_only\",\n"
-        "\t\t\"final\": \"dns-proxy-cf\"\n"
-        "\t},\n"
-        "\t\"inbounds\": [\n"
-        "\t\t{\n"
-        "\t\t\t\"tag\": \"http-in\",\n"
-        "\t\t\t\"type\": \"http\",\n"
-        "\t\t\t\"listen\": \"127.0.0.1\",\n"
-        "\t\t\t\"listen_port\": 10809\n"
-        "\t\t}\n"
-        "\t],\n"
-        "\t\"outbounds\": [\n"
-        "\t\t{\n"
-        "\t\t\t\"tag\": \"🎈 自动选择\",\n"
-        "\t\t\t\"type\": \"urltest\",\n"
-        "\t\t\t\"outbounds\": [\n"
-        "\t\t\t\t\"SEA\"\n"
-        "\t\t\t],\n"
-        "\t\t\t\"url\": \"http://www.gstatic.com/generate_204\",\n"
-        "\t\t\t\"interval\": \"10m\",\n"
-        "\t\t\t\"tolerance\": 50\n"
-        "\t\t},\n"
-        "\t\t{\n"
-        "\t\t\t\"tag\": \"🎯 全球直连\",\n"
-        "\t\t\t\"type\": \"direct\"\n"
-        "\t\t},\n"
-        "\t\t{\n"
-        "\t\t\t\"tag\": \"🚫 断开连接\",\n"
-        "\t\t\t\"type\": \"block\"\n"
-        "\t\t},\n"
-        "\t\t{\n"
-        "\t\t\t\"type\": \"vless\",\n"
-        "\t\t\t\"tag\": \"xxx\",\n"
-        "\t\t\t\"server\": \"xxx.xxx.xxx.xxx\",\n"
-        "\t\t\t\"server_port\": 443,\n"
-        "\t\t\t\"uuid\": \"xxx-xxx-xxx-bb87-b06f9ddc5e89\",\n"
-        "\t\t\t\"flow\": \"\",\n"
-        "\t\t\t\"tls\": {\n"
-        "\t\t\t\t\"enabled\": true,\n"
-        "\t\t\t\t\"server_name\": \"xxx.xxx.xxx\"\n"
-        "\t\t\t},\n"
-        "\t\t\t\"transport\": {\n"
-        "\t\t\t\t\"type\": \"ws\",\n"
-        "\t\t\t\t\"path\": \"/?ed=2560\",\n"
-        "\t\t\t\t\"headers\": {\n"
-        "\t\t\t\t\t\"Host\": \"xxx.xxx.xxx\"\n"
-        "\t\t\t\t}\n"
-        "\t\t\t}\n"
-        "\t\t}\n"
-        "\t],\n"
-        "\t\"route\": {\n"
-        "\t\t\"rules\": [\n"
-        "\t\t\t{\n"
-        "\t\t\t\t\"ip_cidr\": [\n"
-        "\t\t\t\t\t\"119.29.29.29\",\n"
-        "\t\t\t\t\t\"120.53.53.53\"\n"
-        "\t\t\t\t],\n"
-        "\t\t\t\t\"outbound\": \"🎯 全球直连\"\n"
-        "\t\t\t}\n"
-        "\t\t],\n"
-        "\t\t\"final\": \"SEA\",\n"
-        "\t\t\"auto_detect_interface\": true,\n"
-        "\t\t\"find_process\": true\n"
-        "\t}\n"
-        "}";
-
-    FILE* f = NULL;
-    if (_wfopen_s(&f, L"config.json", L"wb") == 0 && f != NULL) {
-        fwrite(defaultConfig, 1, strlen(defaultConfig), f);
-        fclose(f);
-        MessageBoxW(NULL,
-            L"未找到 config.json，已为您生成默认配置文件。\n\n"
-            L"请在使用前修改 config.json 中的 'xxx' 节点信息。", // (--- 已修改提示 ---)
-            L"提示", MB_OK | MB_ICONINFORMATION);
-    } else {
-        MessageBoxW(NULL, L"无法创建默认的 config.json 文件。", L"错误", MB_OK | MB_ICONERROR);
-    }
-}
 
 // =========================================================================
 // (--- 新增：辅助函数，将内存缓冲区写入文件 ---)
@@ -1469,15 +1347,11 @@ void OpenLogViewerWindow() {
 
 
 // =========================================================================
-// (--- 新增：异步初始化工作线程 ---)
-// (--- 已修改：DownloadConfig 调用 ---)
-// (--- 已修改：根据用户要求调整下载失败逻辑 ---)
+// (--- 已修改：InitThread 启动逻辑 ---)
 // =========================================================================
 DWORD WINAPI InitThread(LPVOID lpParam) {
     HWND hWndMain = (HWND)lpParam;
     
-    // (--- 启动逻辑从 wWinMain 迁移至此 ---)
-
     const wchar_t* configPath = L"config.json";
     wchar_t tempConfigPath[MAX_PATH] = {0};
     BOOL isRemoteMode = (wcslen(g_configUrl) > 0);
@@ -1491,7 +1365,7 @@ DWORD WINAPI InitThread(LPVOID lpParam) {
         } while (0)
 
     if (isRemoteMode) {
-        // --- 模式2：远程配置 ---
+        // --- 模式2：远程配置 (URL 已设置) ---
         
         wchar_t tempDir[MAX_PATH];
         DWORD tempPathLen = GetTempPathW(MAX_PATH, tempDir);
@@ -1521,17 +1395,16 @@ DWORD WINAPI InitThread(LPVOID lpParam) {
              tempConfigPath[0] = L'\0'; // 成功后清空
         }
     } else {
-        // --- 模式1：本地配置 ---
-        DWORD fileAttr = GetFileAttributesW(configPath);
-        if (fileAttr == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND) {
-            CreateDefaultConfig();
-        }
+        // --- 模式1：本地配置 (URL 未设置) ---
+        // (--- 已修改：根据用户要求，拒绝启动 ---)
+        ShowError(L"启动失败", L"未在 set.ini 中配置 ConfigUrl。\n此程序需要远程配置 URL 才能启动。\n程序将退出。");
+        THREAD_CLEANUP_AND_EXIT(FALSE);
     }
 
     // --- (公共逻辑：解析) ---
-
+    // 只有在下载成功后才会执行到这里
     if (!ParseTags()) {
-        MessageBoxW(NULL, L"无法读取或解析 config.json 文件。\n请检查文件是否存在且格式正确。", L"JSON 解析失败", MB_OK | MB_ICONERROR);
+        MessageBoxW(NULL, L"无法读取或解析 config.json 文件。\n(可能下载的配置文件格式错误)\n程序将退出。", L"JSON 解析失败", MB_OK | MB_ICONERROR);
         THREAD_CLEANUP_AND_EXIT(FALSE);
     }
 
