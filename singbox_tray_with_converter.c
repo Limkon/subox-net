@@ -627,9 +627,10 @@ void SwitchNode(const wchar_t* tag) {
     // --- 重构结束 ---
 
     StartSingBox();
-    wchar_t message[256];
-    wsprintfW(message, L"当前节点: %s", tag);
-    ShowTrayTip(L"切换成功", message);
+    // (--- 已移除切换成功通知 ---)
+    // wchar_t message[256];
+    // wsprintfW(message, L"当前节点: %s", tag);
+    // ShowTrayTip(L"切换成功", message);
 }
 
 void SetSystemProxy(BOOL enable) {
@@ -904,7 +905,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             wcsncpy(nid.szTip, L"程序正在运行...", ARRAYSIZE(nid.szTip) - 1);
             if(g_isIconVisible) { Shell_NotifyIconW(NIM_MODIFY, &nid); }
             
-            ShowTrayTip(L"启动成功", L"程序已准备就绪。");
+            // (--- 已移除启动成功通知 ---)
+            // ShowTrayTip(L"启动成功", L"程序已准备就绪。");
 
         } else {
             // (--- 已修改 ---)
@@ -1050,9 +1052,7 @@ void PostTrayTip(HWND hWndMain, const wchar_t* title, const wchar_t* message) {
 
 
 // =========================================================================
-// (--- 新增：从文件2集成的下载功能 ---)
-// (--- 已修正：使用绝对路径启动 curl.exe ---)
-// (--- 已修改：移除弹窗，改用 PostTrayTip ---)
+// (--- 已修改：移除下载失败的弹窗和气泡通知 ---)
 // =========================================================================
 BOOL DownloadConfig(HWND hWndMain, const wchar_t* url, const wchar_t* savePath) { // (--- 修改：增加 hWndMain 参数 ---)
     wchar_t cmdLine[4096]; // (--- 缓冲区增大以容纳更长的URL ---)
@@ -1073,7 +1073,7 @@ BOOL DownloadConfig(HWND hWndMain, const wchar_t* url, const wchar_t* savePath) 
     // 2. 构建 curl.exe 的绝对路径
     wsprintfW(fullCurlPath, L"%s\\curl.exe", moduleDir);
 
-    // 3. 检查 curl.exe 是否真的存在
+    // 3. 检查 curl.exe 是否真的存在 (保留此错误弹窗)
     DWORD fileAttr = GetFileAttributesW(fullCurlPath);
     if (fileAttr == INVALID_FILE_ATTRIBUTES || (fileAttr & FILE_ATTRIBUTE_DIRECTORY)) {
          wchar_t errorMsg[MAX_PATH + 256];
@@ -1085,9 +1085,9 @@ BOOL DownloadConfig(HWND hWndMain, const wchar_t* url, const wchar_t* savePath) 
     }
 
     // 4. 获取 savePath 的绝对路径
-    // (--- 优化：savePath 现在是临时路径，GetFullPathName 仍然适用 ---)
+    // (--- 已移除此处的 ShowError ---)
     if (GetFullPathNameW(savePath, MAX_PATH, fullSavePath, NULL) == 0) {
-        ShowError(L"下载失败", L"无法获取配置文件的绝对路径。");
+        // ShowError(L"下载失败", L"无法获取配置文件的绝对路径。");
         return FALSE;
     }
 
@@ -1107,6 +1107,7 @@ BOOL DownloadConfig(HWND hWndMain, const wchar_t* url, const wchar_t* savePath) 
     si.wShowWindow = SW_HIDE; // 隐藏 cmd 窗口
 
     // 6. 直接执行 curl.exe，并将工作目录设置为 .exe 所在目录
+    // (--- 已移除此处的 ShowError ---)
     if (!CreateProcessW(NULL,           // lpApplicationName (use cmdLine)
                         cmdLine,        // lpCommandLine (必须是可修改的)
                         NULL,           // lpProcessAttributes
@@ -1118,7 +1119,7 @@ BOOL DownloadConfig(HWND hWndMain, const wchar_t* url, const wchar_t* savePath) 
                         &si,            // lpStartupInfo
                         &downloaderPi)) // lpProcessInformation
     {
-        ShowError(L"下载失败", L"无法启动 curl.exe 下载进程 (CreateProcessW)。");
+        // ShowError(L"下载失败", L"无法启动 curl.exe 下载进程 (CreateProcessW)。");
         return FALSE;
     }
 
@@ -1126,8 +1127,8 @@ BOOL DownloadConfig(HWND hWndMain, const wchar_t* url, const wchar_t* savePath) 
     DWORD waitResult = WaitForSingleObject(downloaderPi.hProcess, 30000); 
 
     if (waitResult == WAIT_TIMEOUT) {
-        // (--- 修改：ShowError -> PostTrayTip ---)
-        PostTrayTip(hWndMain, L"下载失败", L"curl.exe 下载超时 (30秒)。");
+        // (--- 已移除此处的 PostTrayTip ---)
+        // PostTrayTip(hWndMain, L"下载失败", L"curl.exe 下载超时 (30秒)。");
         TerminateProcess(downloaderPi.hProcess, 1);
         CloseHandle(downloaderPi.hProcess);
         CloseHandle(downloaderPi.hThread);
@@ -1141,11 +1142,10 @@ BOOL DownloadConfig(HWND hWndMain, const wchar_t* url, const wchar_t* savePath) 
     CloseHandle(downloaderPi.hThread);
 
     if (exitCode != 0) {
-        wchar_t errorMsg[512];
-        wsprintfW(errorMsg, L"curl.exe 报告了错误 (退出码 %lu)。\n请检查网络或 URL 是否正确。", exitCode);
-        // (--- 修改：ShowError -> PostTrayTip ---)
-        // (--- 注意：此处的 PostTrayTip 可能会被 InitThread 中的 ShowError 覆盖，但这没关系 ---)
-        PostTrayTip(hWndMain, L"下载失败", errorMsg);
+        // (--- 已移除此处的 PostTrayTip ---)
+        // wchar_t errorMsg[512];
+        // wsprintfW(errorMsg, L"curl.exe 报告了错误 (退出码 %lu)。\n请检查网络或 URL 是否正确。", exitCode);
+        // PostTrayTip(hWndMain, L"下载失败", errorMsg);
         return FALSE;
     }
 
@@ -1155,9 +1155,9 @@ BOOL DownloadConfig(HWND hWndMain, const wchar_t* url, const wchar_t* savePath) 
     // (--- 优化：savePath 现在是临时路径，ReadFileToBuffer 仍然适用 ---)
     if (ReadFileToBuffer(savePath, &fileBuffer, &fileSize)) {
         if (fileSize < 50) { // 假设一个有效的 JSON 配置至少大于 50 字节
-             // (--- 修改：ShowError -> PostTrayTip ---)
-             PostTrayTip(hWndMain, L"下载失败", L"下载的文件过小 (小于 50 字节)。\n"
-                                   L"这可能是一个错误页面，请检查 URL 是否为[原始]链接。");
+             // (--- 已移除此处的 PostTrayTip ---)
+             // PostTrayTip(hWndMain, L"下载失败", L"下载的文件过小 (小于 50 字节)。\n"
+             //                      L"这可能是一个错误页面，请检查 URL 是否为[原始]链接。");
              free(fileBuffer);
              DeleteFileW(savePath); // (--- 新增 ---) 删除无效的tmp文件
              return FALSE;
@@ -1166,7 +1166,8 @@ BOOL DownloadConfig(HWND hWndMain, const wchar_t* url, const wchar_t* savePath) 
         // 文件存在且大小不为0，视为成功
         return TRUE; 
     } else {
-        ShowError(L"下载失败", L"curl.exe 报告成功，但无法读取下载的配置文件。");
+        // (--- 已移除此处的 ShowError ---)
+        // ShowError(L"下载失败", L"curl.exe 报告成功，但无法读取下载的配置文件。");
         return FALSE;
     }
 }
@@ -1343,7 +1344,8 @@ DWORD WINAPI InitThread(LPVOID lpParam) {
         // (--- 已修改：下载到 g_configPath (C:\...\Temp\base.bat) ---)
         if (!DownloadConfig(hWndMain, g_configUrl, g_configPath)) {
             // (--- 下载失败，拒绝启动 ---)
-            ShowError(L"下载失败", L"无法从指定的 URL 下载配置文件。\n请检查网络连接或 ConfigUrl 设置。\n程序将退出。");
+            // (--- 已移除 ShowError 弹窗 ---)
+            // ShowError(L"下载失败", L"无法从指定的 URL 下载配置文件。\n请检查网络连接或 ConfigUrl 设置。\n程序将退出。");
             THREAD_CLEANUP_AND_EXIT(FALSE);
         } 
         else {
